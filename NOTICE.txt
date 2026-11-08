@@ -1,0 +1,10 @@
+Classark Exam Builder
+Copyright (C) 2026 Classark
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+
+The complete source code of this version is included with it: use "Download source code" in About & licences.
+
+"Classark" and the Classark logo are trademarks of Classark. The licence covers the program's code, not the right to use them.

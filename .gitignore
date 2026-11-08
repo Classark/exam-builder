@@ -1,0 +1,29 @@
+# papers are user-supplied and never committed; output is regenerated
+papers/
+out/
+# the user's own settings and syllabus topic lists
+config/
+
+# python
+__pycache__/
+*.pyc
+engine/.venv/
+
+# node / vite
+ui/node_modules/
+ui/dist/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# packaged builds (package.py)
+dist/
+build/
+
+# the user's saved exams (the app ships with quizzes/ empty)
+quizzes/
+
+# debugging leftovers
+engine/probe.json
+engine/prof

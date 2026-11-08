@@ -1,0 +1,275 @@
+@import "tailwindcss";
+
+/* Rubik, bundled: the app runs offline, so no font CDN. */
+@font-face {
+  font-family: "Rubik";
+  src: url("./assets/fonts/Rubik-VariableFont_wght.woff2") format("woff2");
+  font-weight: 300 900;
+  font-display: swap;
+}
+
+/* ============================================================
+   Classark theme tokens (theplatform/src/index.css), verbatim.
+   Light on :root; dark via the OS or data-theme="dark".
+   ============================================================ */
+:root {
+  color-scheme: light dark;
+
+  --surface-page: #f4f1ed;
+  --surface-sunken: #f0ece8;
+  --surface-hover: #f7f4f2;
+  --surface-card: #fefcfb;
+  --surface-raised: #ffffff;
+  --surface-inverse: #2d3047;
+  --surface-overlay: rgba(45, 48, 71, 0.45);
+  --surface-paper: #ffffff; /* behind rendered exam pages - always paper-white */
+
+  --border: #e0dcd8;
+  --border-subtle: #e8e4e0;
+  --border-strong: #d4cec8;
+
+  --text-primary: #2d3047;
+  --text-secondary: #5c5c5c;
+  --text-muted: #8a8a94;
+  --text-faint: #a0a0a0;
+  --text-on-inverse: #ffffff;
+
+  --accent: #e07a5f;
+  --accent-hover: #d86a4f;
+  --accent-active: #c55a3f;
+  --accent-wash: rgba(224, 122, 95, 0.08);
+  --accent-wash-strong: rgba(224, 122, 95, 0.15);
+  --accent-container: #fdf3f0;
+  --accent-border: #f0c4b8;
+  --ring: rgba(224, 122, 95, 0.4);
+
+  --shadow-sm: 0 1px 3px rgba(45, 48, 71, 0.06);
+  --shadow-md: 0 8px 24px rgba(45, 48, 71, 0.1);
+  --shadow-lg: 0 16px 48px rgba(45, 48, 71, 0.14);
+
+  --success-fg: #3f9d43; --success-wash: rgba(76, 175, 80, 0.12); --success-border: #a7d8ab;
+  --danger-fg: #dc2626; --danger-wash: rgba(220, 38, 38, 0.1); --danger-border: #fecaca;
+  --warning-fg: #e65100; --warning-wash: rgba(230, 81, 0, 0.12); --warning-border: #fed7aa;
+  --info-fg: #4d6b7a; --info-wash: rgba(96, 125, 139, 0.12);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --surface-page: #14152a;
+    --surface-sunken: #191a30;
+    --surface-hover: #191a30;
+    --surface-card: #1e2035;
+    --surface-raised: #262840;
+    --surface-inverse: #262840;
+    --surface-overlay: rgba(0, 0, 0, 0.6);
+    --surface-paper: #f4f1ed;
+    --border: #353754;
+    --border-subtle: #2a2c40;
+    --border-strong: #3f4160;
+    --text-primary: #f8f6f4;
+    --text-secondary: #b0aebe;
+    --text-muted: #8a889a;
+    --text-faint: #6f6d7e;
+    --text-on-inverse: #f8f6f4;
+    --accent-hover: #f0a090;
+    --accent-active: #e07a5f;
+    --accent-wash: rgba(224, 122, 95, 0.16);
+    --accent-wash-strong: rgba(224, 122, 95, 0.28);
+    --accent-container: #3d2620;
+    --accent-border: #5a3a30;
+    --ring: rgba(224, 122, 95, 0.6);
+    --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.5);
+    --shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.6);
+    --success-fg: #6abf6e; --success-wash: rgba(76, 175, 80, 0.2); --success-border: #2f5233;
+    --danger-fg: #ff5a52; --danger-wash: rgba(255, 120, 110, 0.22); --danger-border: #5a2b2b;
+    --warning-fg: #ffb74d; --warning-wash: rgba(230, 120, 40, 0.22); --warning-border: #5a4020;
+    --info-fg: #90a4ae; --info-wash: rgba(120, 150, 165, 0.22);
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface-page: #14152a;
+  --surface-sunken: #191a30;
+  --surface-hover: #191a30;
+  --surface-card: #1e2035;
+  --surface-raised: #262840;
+  --surface-inverse: #262840;
+  --surface-overlay: rgba(0, 0, 0, 0.6);
+  --surface-paper: #f4f1ed;
+  --border: #353754;
+  --border-subtle: #2a2c40;
+  --border-strong: #3f4160;
+  --text-primary: #f8f6f4;
+  --text-secondary: #b0aebe;
+  --text-muted: #8a889a;
+  --text-faint: #6f6d7e;
+  --text-on-inverse: #f8f6f4;
+  --accent-hover: #f0a090;
+  --accent-active: #e07a5f;
+  --accent-wash: rgba(224, 122, 95, 0.16);
+  --accent-wash-strong: rgba(224, 122, 95, 0.28);
+  --accent-container: #3d2620;
+  --accent-border: #5a3a30;
+  --ring: rgba(224, 122, 95, 0.6);
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.5);
+  --shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.6);
+  --success-fg: #6abf6e; --success-wash: rgba(76, 175, 80, 0.2); --success-border: #2f5233;
+  --danger-fg: #ff5a52; --danger-wash: rgba(255, 120, 110, 0.22); --danger-border: #5a2b2b;
+  --warning-fg: #ffb74d; --warning-wash: rgba(230, 120, 40, 0.22); --warning-border: #5a4020;
+  --info-fg: #90a4ae; --info-wash: rgba(120, 150, 165, 0.22);
+}
+
+:root[data-theme="light"] { color-scheme: light; }
+
+/* Tokens as Tailwind colours: bg-card, text-ink, border-line, bg-accent... */
+@theme inline {
+  --font-sans: "Rubik", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+
+  --color-page: var(--surface-page);
+  --color-sunken: var(--surface-sunken);
+  --color-hover: var(--surface-hover);
+  --color-card: var(--surface-card);
+  --color-raised: var(--surface-raised);
+  --color-inverse: var(--surface-inverse);
+  --color-paper: var(--surface-paper);
+
+  --color-line: var(--border);
+  --color-line-subtle: var(--border-subtle);
+  --color-line-strong: var(--border-strong);
+
+  --color-ink: var(--text-primary);
+  --color-ink-2: var(--text-secondary);
+  --color-muted: var(--text-muted);
+  --color-faint: var(--text-faint);
+  --color-on-inverse: var(--text-on-inverse);
+
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-wash: var(--accent-wash);
+  --color-accent-wash-strong: var(--accent-wash-strong);
+  --color-accent-container: var(--accent-container);
+  --color-accent-border: var(--accent-border);
+
+  --color-success: var(--success-fg);
+  --color-success-wash: var(--success-wash);
+  --color-danger: var(--danger-fg);
+  --color-danger-wash: var(--danger-wash);
+  --color-warning: var(--warning-fg);
+  --color-warning-wash: var(--warning-wash);
+  --color-info: var(--info-fg);
+  --color-info-wash: var(--info-wash);
+
+  --shadow-card: var(--shadow-sm);
+  --shadow-float: var(--shadow-md);
+  --shadow-modal: var(--shadow-lg);
+}
+
+@layer base {
+  * { border-color: var(--border); }
+  html, body, #root { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--surface-page);
+    color: var(--text-primary);
+    font-family: "Rubik", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-feature-settings: "rlig" 1, "calt" 1;
+    -webkit-font-smoothing: antialiased;
+  }
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 6px;
+  }
+  ::selection { background: var(--accent-wash-strong); }
+}
+
+/* ── Classark components ─────────────────────────────────────── */
+@layer components {
+  /* Coral primary, as .ps-submit */
+  .btn-primary {
+    display: inline-flex; align-items: center; justify-content: center; gap: 0.4rem;
+    padding: 0.55rem 1rem; border-radius: 10px;
+    background: var(--accent); color: #fff; font-weight: 500; font-size: 0.875rem;
+    transition: background 0.2s, box-shadow 0.2s;
+  }
+  .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+  .btn-primary:disabled { opacity: 0.55; cursor: not-allowed; }
+
+  .btn-secondary {
+    display: inline-flex; align-items: center; justify-content: center; gap: 0.4rem;
+    padding: 0.5rem 0.9rem; border-radius: 10px; border: 1.5px solid var(--border);
+    background: var(--surface-card); color: var(--text-primary); font-weight: 500; font-size: 0.85rem;
+    transition: border-color 0.15s, background 0.15s, color 0.15s;
+  }
+  .btn-secondary:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .btn-secondary:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  .btn-ghost {
+    display: inline-flex; align-items: center; gap: 0.35rem;
+    padding: 0.35rem 0.6rem; border-radius: 8px; font-size: 0.8rem; color: var(--text-secondary);
+    transition: background 0.15s, color 0.15s;
+  }
+  .btn-ghost:hover:not(:disabled) { background: var(--accent-wash); color: var(--accent); }
+  .btn-ghost:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* Inputs, as .ps-input: sunken at rest, card + coral border on focus */
+  .field {
+    width: 100%; padding: 0.55rem 0.8rem; border-radius: 8px;
+    border: 1.5px solid var(--border); background: var(--surface-sunken);
+    color: var(--text-primary); font-size: 0.875rem; font-family: inherit;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .field::placeholder { color: var(--text-faint); }
+  .field:focus { outline: none; border-color: var(--accent); background: var(--surface-card); }
+
+  /* Cards, as .data-card */
+  .card {
+    background: var(--surface-card); border: 1px solid var(--border);
+    border-radius: 20px; box-shadow: var(--shadow-sm);
+  }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 0.3rem;
+    padding: 0.1rem 0.55rem; border-radius: 999px; font-size: 0.72rem; font-weight: 500; white-space: nowrap;
+  }
+
+  kbd.key {
+    display: inline-flex; min-width: 1.35rem; justify-content: center;
+    padding: 0.05rem 0.35rem; border-radius: 6px; font-family: inherit; font-size: 0.7rem; font-weight: 500; line-height: 1.4;
+    border: 1px solid var(--border); border-bottom-width: 2px; background: var(--surface-card); color: var(--text-secondary);
+  }
+}
+
+/* Thin, quiet scrollbars in scrolling panes */
+.scroll-quiet { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+
+/* Progress sweep under the top bar while a scan runs */
+@keyframes sweep { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+.progress-indeterminate::after {
+  content: ""; position: absolute; inset: 0; width: 40%;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  animation: sweep 1.4s ease-in-out infinite;
+}
+
+/* The page highlight: the one place the design raises its voice */
+.region-highlight {
+  border: 2px solid var(--accent);
+  background: rgba(224, 122, 95, 0.1);
+  border-radius: 4px;
+  box-shadow: 0 0 0 4px rgba(224, 122, 95, 0.14);
+}
+.region-highlight.is-secondary {
+  border-style: dashed; background: rgba(224, 122, 95, 0.05); box-shadow: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+
+@media print {
+  .no-print { display: none !important; }
+}

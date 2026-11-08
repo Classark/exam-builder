@@ -1,0 +1,2 @@
+This copy of Classark Exam Builder was installed. It keeps its data in
+%LOCALAPPDATA%\ClassarkExamBuilder, not in this folder.

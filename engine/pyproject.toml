@@ -1,0 +1,28 @@
+[project]
+name = "qbx"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # 2.0, not 1.28: 1.28's redaction rewrote "Td" as "TD", resetting the leading, so text
+    # after a "T*" jumped lines in composed papers (0452/12 MJ26 Q2's table)
+    "pymupdf>=2.0",
+    "pydantic>=2.13.5",
+    "typer>=0.27.2",
+    "fastapi>=0.141.1",
+    "uvicorn>=0.53.0",
+    "python-multipart>=0.0.32",
+    "claude-agent-sdk>=0.2.159",
+    "pywebview>=6.2.1",
+    "anthropic>=2.6.0",
+    "keyring>=25.7.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pyinstaller>=6.22.3",
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
