@@ -11,6 +11,12 @@ dependencies = [
     # Intel Mac build at all). The engine uses neither; qbx/__init__.py sets the glyph
     # correction itself, so both read text alike.
     "pymupdf-lite>=2.0; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    # Not used directly (the Claude Code SDK -> mcp[crypto] -> pyjwt). cryptography 49+
+    # publishes no Intel Mac wheel, so Intel builds compiled it against the build Mac's own
+    # OpenSSL - and the app then needed that Mac's macOS (26 on the iMac, 15 on CI;
+    # package.check_mac_minimum caught it). 48.0.1 is the last with one (universal2, 10.9+);
+    # uv resolves one version for every platform, so all builds use 48.
+    "cryptography<49; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "pydantic>=2.13.5",
     "typer>=0.27.2",
     "fastapi>=0.141.1",

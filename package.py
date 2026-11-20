@@ -592,6 +592,76 @@ def _notary_profile() -> str:
     return "qbx" if check.returncode == 0 else ""
 
 
+# The oldest macOS the app runs on (Info.plist's LSMinimumSystemVersion) - and every compiled
+# file in it must agree, which check_mac_minimum enforces.
+MAC_MINIMUM = (11, 0)
+
+_LC_VERSION_MIN_MACOSX = 0x24
+_LC_BUILD_VERSION = 0x32
+_PLATFORM_MACOS = 1
+
+
+def _slice_minimum(data: bytes, start: int) -> tuple[int, ...] | None:
+    """The oldest macOS one Mach-O image (at `start` in `data`) says it runs on, or None."""
+    import struct
+
+    magic = struct.unpack_from("<I", data, start)[0]
+    if magic not in (0xFEEDFACE, 0xFEEDFACF):
+        return None
+    ncmds = struct.unpack_from("<I", data, start + 16)[0]
+    offset = start + (32 if magic == 0xFEEDFACF else 28)
+    for _ in range(ncmds):
+        cmd, size = struct.unpack_from("<II", data, offset)
+        if cmd == _LC_BUILD_VERSION and struct.unpack_from("<I", data, offset + 8)[0] == _PLATFORM_MACOS:
+            packed = struct.unpack_from("<I", data, offset + 12)[0]
+        elif cmd == _LC_VERSION_MIN_MACOSX:
+            packed = struct.unpack_from("<I", data, offset + 8)[0]
+        else:
+            offset += size
+            if size == 0:
+                break
+            continue
+        return packed >> 16, (packed >> 8) & 0xFF
+    return None
+
+
+def mach_o_minimum(path: Path) -> tuple[int, ...] | None:
+    """The newest "oldest macOS" any architecture in the file asks for, or None when it
+    isn't a Mach-O file (or carries no such stamp)."""
+    import struct
+
+    with open(path, "rb") as f:
+        head = f.read(4)
+        if head not in (b"\xca\xfe\xba\xbe", b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe"):
+            return None
+        data = head + f.read()
+    if head == b"\xca\xfe\xba\xbe":  # universal: one image per architecture
+        count = struct.unpack_from(">I", data, 4)[0]
+        if count > 30:  # a Java class file shares this magic
+            return None
+        found = [_slice_minimum(data, struct.unpack_from(">I", data, 8 + 20 * i + 8)[0]) for i in range(count)]
+        found = [m for m in found if m]
+        return max(found) if found else None
+    return _slice_minimum(data, 0)
+
+
+def check_mac_minimum(app: Path) -> None:
+    """Stops the build when a compiled file in the app needs a newer macOS than MAC_MINIMUM.
+    Everything bundled today is a ready-made wheel built for macOS 11 or older; one compiled
+    during the build instead (no wheel for that chip) would target the CI Mac's own macOS
+    (26) and the app would silently stop opening on older Macs (user-asked)."""
+    too_new = []
+    for path in app.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            minimum = mach_o_minimum(path)
+            if minimum and minimum > MAC_MINIMUM:
+                too_new.append(f"  {path.relative_to(app)}: macOS {'.'.join(map(str, minimum))}")
+    if too_new:
+        sys.exit(f"these need a newer macOS than {'.'.join(map(str, MAC_MINIMUM))}, so the app "
+                 "wouldn't open on older Macs:\n" + "\n".join(too_new))
+    print(f"every compiled file runs on macOS {'.'.join(map(str, MAC_MINIMUM))}+")
+
+
 def build_mac(ui_dist: Path, version: str, out_dir: Path = DIST) -> None:
     """"Classark Exam Builder.app" via PyInstaller, signed (hardened runtime, which
     notarisation requires), wrapped in a DMG with an Applications shortcut, notarised and
@@ -610,13 +680,14 @@ def build_mac(ui_dist: Path, version: str, out_dir: Path = DIST) -> None:
     PyInstaller.__main__.run(args)
 
     app = out_dir / f"{APP_NAME}.app"
+    check_mac_minimum(app)
     info_path = app / "Contents" / "Info.plist"
     info = plistlib.loads(info_path.read_bytes())
     info.update(
         CFBundleDisplayName=APP_NAME,
         CFBundleShortVersionString=version,
         CFBundleVersion=version,
-        LSMinimumSystemVersion="11.0",
+        LSMinimumSystemVersion=".".join(map(str, MAC_MINIMUM)),
         NSHighResolutionCapable=True,
     )
     info_path.write_bytes(plistlib.dumps(info))
