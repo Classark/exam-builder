@@ -41,9 +41,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Apple Silicon on macos-14: GitHub's macos-15 arm64 machines were too busy to take
-        # the job at all (cancelled, "not acquired by Runner"). Both build for macOS 11+.
-        runner: [macos-14, macos-15-intel]
+        # Apple Silicon on macos-26 (what macos-latest points to, named outright so a build
+        # never moves OS by itself): macos-15's arm64 machines never took the job ("not
+        # acquired by Runner"), and macos-14 was retired in November 2026. The app still
+        # runs on macOS 11+ (LSMinimumSystemVersion).
+        runner: [macos-26, macos-15-intel]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
