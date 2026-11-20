@@ -1,19 +1,24 @@
 import { useEffect, useState } from 'react'
-import { BookOpen, ClipboardCheck, ExternalLink, Info, Layers, Loader2, Moon, Settings as SettingsIcon, Sparkles, Sun, UserRound } from 'lucide-react'
-import { About } from './About'
+import { BookOpen, ClipboardCheck, FolderOpen, Layers, Settings as SettingsIcon, Sparkles, UserRound } from 'lucide-react'
 import { AccountMenu } from './AccountMenu'
+import { ActivityBar, ActivityProvider } from './activity'
+import { api } from './api'
 import { Classification } from './Classification'
 import { ClaudeChat } from './ClaudeChat'
 import { useDesktop, WindowControls } from './desktop'
 import { QuestionBank } from './QuestionBank'
 import { Reviewer } from './Reviewer'
 import { ScanControl } from './ScanControl'
+import { LibraryStatus } from './LibraryStatus'
 import { Settings } from './Settings'
+import { TaggingControl } from './Tagging'
+import { SavedFiles, SaveFolderPrompt, SaveFolderSettings, SaveNotice } from './Saving'
 import { SignInScreen } from './SignIn'
+import { TermsPrompt } from './Terms'
+import { UpdateScreen } from './UpdateScreen'
 import { useLive } from './live'
 
 type Tab = 'reviewer' | 'bank' | 'claude' | 'classified'
-type Theme = 'light' | 'dark'
 
 function stored<T extends string>(key: string, allowed: T[]): T | null {
   try {
@@ -32,35 +37,37 @@ function remember(key: string, value: string) {
   }
 }
 
-function useTheme(): [Theme, () => void] {
-  const system = () => (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
-  const [theme, setTheme] = useState<Theme>(() => stored('qbx.theme', ['light', 'dark']) ?? system())
-  useEffect(() => {
-    document.documentElement.dataset.theme = theme
-  }, [theme])
-  return [
-    theme,
-    () =>
-      setTheme((current) => {
-        const next = current === 'dark' ? 'light' : 'dark'
-        remember('qbx.theme', next)
-        return next
-      }),
-  ]
-}
-
 function App() {
   const [tab, setTab] = useState<Tab>(() => stored('qbx.tab', ['reviewer', 'bank', 'claude', 'classified']) ?? 'reviewer')
-  const [theme, toggleTheme] = useTheme()
   const desktop = useDesktop()
-  const { papers, tagging, ai, edition, account, ready } = useLive()
+  const { papers, ai, edition, account, ready, update } = useLive()
   const [settingsOpen, setSettingsOpen] = useState(false)
-  const [aboutOpen, setAboutOpen] = useState(false)
   const [accountOpen, setAccountOpen] = useState(false)
-  // A release build opens on the sign-in screen until the teacher signs in or carries on
-  // without an account (remembered here; signing out shows it again).
-  const [skipped, setSkipped] = useState(() => stored('qbx.signin', ['skipped']) === 'skipped')
-  const gate = ready && edition === 'release' && account.status !== 'signed_in' && !skipped
+  // A release build shows only the sign-in screen until the teacher signs in (user-decided:
+  // no carrying on without an account); signing out shows it again.
+  // The terms come before anything else, sign-in included (user-asked; qbx/terms.py):
+  // null until known, then the version to agree to, or '' once agreed.
+  const [termsToAgree, setTermsToAgree] = useState<string | null>(null)
+  useEffect(() => {
+    void api.getTerms().then((t) => setTermsToAgree(t.accepted ? '' : t.version)).catch(() => setTermsToAgree(''))
+  }, [])
+  // Before everything, terms included: a release build older than Classark's minimum
+  // version (config/app, qbx/app_version.py) shows "Please update" and nothing else.
+  const updateGate = ready && edition === 'release' && !!update?.required
+  const termsDue = termsToAgree !== ''
+  const signInGate = ready && edition === 'release' && account.status !== 'signed_in'
+  const gate = updateGate || signInGate || termsDue
+  const [savedOpen, setSavedOpen] = useState(false)
+  // Asked once, straight after sign-in (user-decided): where exams are saved.
+  const [askFolder, setAskFolder] = useState(false)
+  useEffect(() => {
+    if (!ready || gate) return
+    let live = true
+    void api.getSaving().then((s) => live && setAskFolder(!s.chosen)).catch(() => {})
+    return () => {
+      live = false
+    }
+  }, [ready, gate])
   // an exam handed between the two modes, opened when the other one shows
   const [handedExam, setHandedExam] = useState<string | null>(null)
   const open = papers.reduce((sum, p) => sum + (p.n_open > 0 ? 1 : 0), 0)
@@ -91,6 +98,7 @@ function App() {
   const shown: Tab = !ai && tab === 'claude' ? 'bank' : tab
 
   return (
+    <ActivityProvider>
     <div className="flex h-full flex-col">
       {/* Classark's top bar: navy, square-cornered, two-weight wordmark */}
       <header className="no-print relative z-30 flex shrink-0 items-center gap-3 bg-inverse px-4 py-3 whitespace-nowrap lg:gap-6 lg:px-6 shadow-[0_4px_20px_rgba(45,48,71,0.15)] [app-region:drag] [&_:is(button,input,select,textarea,a,.absolute,.fixed)]:[app-region:no-drag]">
@@ -117,7 +125,7 @@ function App() {
             >
               <Icon size={16} strokeWidth={2} />
               {/* icon only when the window is too narrow for the whole bar */}
-              <span className="hidden lg:inline">{label}</span>
+              <span className="hidden xl:inline">{label}</span>
               {badge !== undefined && (
                 <span
                   className={`rounded-full px-1.5 text-xs leading-5 ${tab === id ? 'bg-white/25' : 'bg-accent'}`}
@@ -140,45 +148,36 @@ function App() {
                 }`}
               >
                 <Icon size={16} strokeWidth={2} />
-                <span className="hidden lg:inline">{label}</span>
+                <span className="hidden xl:inline">{label}</span>
               </button>
             ))}
           </div>
         </nav>
 
         <div className="ml-auto flex min-w-0 items-center gap-2">
-          {tagging.running && (
-            <button
-              onClick={() => setSettingsOpen(true)}
-              className="flex items-center gap-2 rounded-xl bg-white/10 px-3 py-2 text-xs text-on-inverse"
-              title="Tagging questions with topics"
-            >
-              <Loader2 size={13} className="animate-spin" />
-              {tagging.total ? `Tagging ${tagging.done ?? 0} of ${tagging.total}` : 'Tagging…'}
-            </button>
-          )}
+          {!gate && <TaggingControl />}
           {!gate && <ScanControl />}
-          {desktop && (
+          {!gate && <LibraryStatus />}
+          {!gate && (
             <button
-              onClick={() => void desktop.open_in_browser()}
-              className="hidden rounded-xl border border-white/15 bg-white/10 p-2.5 text-on-inverse transition-colors hover:border-accent/40 hover:bg-accent/30 lg:block"
-              aria-label="Open in browser"
-              title="Open in your web browser"
-            >
-              <ExternalLink size={16} />
-            </button>
-          )}
-          {/* Settings (Claude Code, models) are for testing: debug builds only (qbx/edition.py) */}
-          {edition === 'debug' && (
-            <button
-              onClick={() => setSettingsOpen(true)}
+              onClick={() => setSavedOpen(true)}
               className="rounded-xl border border-white/15 bg-white/10 p-2.5 text-on-inverse transition-colors hover:border-accent/40 hover:bg-accent/30"
-              aria-label="Settings"
-              title="Settings: Claude and topics"
+              aria-label="Saved files"
+              title="Saved files"
             >
-              <SettingsIcon size={16} />
+              <FolderOpen size={16} />
             </button>
           )}
+          {/* Every build: theme, save folder, About & licences; debug builds add Claude Code,
+              models and topics (qbx/edition.py) */}
+          <button
+            onClick={() => setSettingsOpen(true)}
+            className="rounded-xl border border-white/15 bg-white/10 p-2.5 text-on-inverse transition-colors hover:border-accent/40 hover:bg-accent/30"
+            aria-label="Settings"
+            title={edition === 'debug' ? 'Settings: appearance, save folder, Claude, topics, about' : 'Settings: appearance, save folder, about'}
+          >
+            <SettingsIcon size={16} />
+          </button>
           <button
             onClick={() => setAccountOpen(true)}
             className="rounded-xl border border-white/15 bg-white/10 p-2.5 text-on-inverse transition-colors hover:border-accent/40 hover:bg-accent/30"
@@ -187,35 +186,17 @@ function App() {
           >
             <UserRound size={16} />
           </button>
-          <button
-            onClick={() => setAboutOpen(true)}
-            className="rounded-xl border border-white/15 bg-white/10 p-2.5 text-on-inverse transition-colors hover:border-accent/40 hover:bg-accent/30"
-            aria-label="About and licences"
-            title="About & licences"
-          >
-            <Info size={16} />
-          </button>
-          <button
-            onClick={toggleTheme}
-            className="rounded-xl border border-white/15 bg-white/10 p-2.5 text-on-inverse transition-colors hover:border-accent/40 hover:bg-accent/30"
-            aria-label={theme === 'dark' ? 'Use light theme' : 'Use dark theme'}
-            title={theme === 'dark' ? 'Light theme' : 'Dark theme'}
-          >
-            {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
-          </button>
         </div>
         {desktop && <WindowControls desktop={desktop} />}
       </header>
+      {!gate && <ActivityBar />}
 
-      {gate ? (
-        <SignInScreen
-          account={account}
-          onSkip={() => {
-            remember('qbx.signin', 'skipped')
-            setSkipped(true)
-          }}
-          onAbout={() => setAboutOpen(true)}
-        />
+      {updateGate && update ? (
+        <UpdateScreen update={update} />
+      ) : signInGate ? (
+        <SignInScreen account={account} />
+      ) : termsDue ? (
+        <div className="min-h-0 flex-1 bg-page" />
       ) : (
       <main className="min-h-0 flex-1">
         {shown === 'reviewer' ? (
@@ -233,23 +214,24 @@ function App() {
         )}
       </main>
       )}
-      {settingsOpen && edition === 'debug' && <Settings onClose={() => setSettingsOpen(false)} />}
-      {aboutOpen && <About onClose={() => setAboutOpen(false)} />}
+      {settingsOpen &&
+        (edition === 'debug' ? (
+          <Settings onClose={() => setSettingsOpen(false)} />
+        ) : (
+          <SaveFolderSettings onClose={() => setSettingsOpen(false)} />
+        ))}
+      {termsToAgree && !updateGate && <TermsPrompt version={termsToAgree} onAccepted={() => setTermsToAgree('')} />}
+      {savedOpen && <SavedFiles onClose={() => setSavedOpen(false)} />}
+      {askFolder && !gate && <SaveFolderPrompt onDone={() => setAskFolder(false)} />}
+      <SaveNotice />
       {accountOpen && (
         <AccountMenu
           account={account}
           onClose={() => setAccountOpen(false)}
-          onAbout={() => {
-            setAccountOpen(false)
-            setAboutOpen(true)
-          }}
-          onSignedOut={() => {
-            remember('qbx.signin', '')
-            setSkipped(false)
-          }}
         />
       )}
     </div>
+    </ActivityProvider>
   )
 }
 

@@ -10,17 +10,23 @@ from pathlib import Path
 import pymupdf
 
 from qbx import edexcel, fixes, ingest, join, markscheme, markscheme_edexcel, ms_links, tree
+from qbx.inserts import cover_needs_insert
 from qbx.markscheme_edexcel import scheme_layout
-from qbx.anchors import HEADER_FOOTER_MARGIN, find_anchor_spans, resolve_tiers
+from qbx.anchors import HEADER_FOOTER_MARGIN, top_margin, find_anchor_spans, page_text, marker_page_shifts, place_moved_numbers, resolve_tiers
 from qbx.crops import crop_to_svg, page_segments
 from qbx.pairing import check_pair
-from qbx.fingerprint import parse_footer, read_cover_titles
-from qbx.pages import PageType, classify_document
+from qbx.fingerprint import FingerprintError, parse_footer, read_cover_titles
+from qbx.pages import PageType, classify_document, empty_pages
 from qbx.schema import BBox, MarkSchemeEntry, Paper, Question, QuestionPart, QuestionPartMarkScheme
 from qbx.validate import Report, is_removed_notice, removed_target, validate_paper
 
 _COVER_TOTAL_RE = re.compile(r"total mark for this paper is (\d+)", re.IGNORECASE)
 _COVER_PAGES_RE = re.compile(r"document has (\d+) pages", re.IGNORECASE)
+# A paper with a choice: "Answer four questions in total" (0455 Paper 2: Q1, then any three of
+# Q2-5), or "Answer any three questions" with no sections. The cover's total counts only the
+# questions answered, so the paper prints more marks than the cover (user-reported).
+_ANSWER_IN_TOTAL_RE = re.compile(r"answer\s+(?:any\s+)?([a-z]+(?:-[a-z]+)?|\d{1,2})\s+questions\s+in\s+total", re.IGNORECASE)
+_ANSWER_ANY_RE = re.compile(r"answer\s+any\s+([a-z]+(?:-[a-z]+)?|\d{1,2})\s+questions", re.IGNORECASE)
 # Real-paper finding (0620 MCQ papers, 2016-2019): these covers never print a total - they
 # say "There are forty questions on this paper" and "Each correct answer will score one
 # mark" - so the cover-total check was silently skipped on every one. The two together are
@@ -46,6 +52,17 @@ def _number_from_words(text: str) -> int | None:
     return sum(_NUMBER_WORDS[w] for w in words)
 
 
+def read_questions_answered(cover_text: str) -> int | None:
+    """How many questions a candidate answers, when the cover gives a choice; None when every
+    question is answered. "Answer any three" counts alone only on a cover with no sections -
+    with sections, it's one section's share."""
+    text = " ".join(cover_text.split())
+    match = _ANSWER_IN_TOTAL_RE.search(text)
+    if not match and not re.search(r"\bsection\s+[A-Z]\b", text, re.IGNORECASE):
+        match = _ANSWER_ANY_RE.search(text)
+    return _number_from_words(match.group(1)) if match else None
+
+
 def read_cover_total(cover_text: str) -> int | None:
     match = _COVER_TOTAL_RE.search(cover_text)
     if match:
@@ -65,7 +82,7 @@ def _asset_name(question_number: int, label: str) -> str:
     return f"q{question_number}{label.replace('.', '_')}.svg"
 
 
-def _mark_removed(questions, mark_scheme, joins) -> None:
+def _mark_removed(questions, mark_scheme, joins, qp_notices=()) -> set[tuple[int, str]]:
     """Questions and parts the board withdrew, by its notice: on the paper in place of the
     question ("5 Due to an issue with Question 5, the question has been removed from the
     question paper", 0478/22 MJ23, 0625/21 MJ24), or only in the scheme's row for a question
@@ -74,7 +91,9 @@ def _mark_removed(questions, mark_scheme, joins) -> None:
     # each notice names what it withdraws ("Due to an issue with Question 5"), or says "this
     # question" of its own; a named one can sit in another row - 0478/22 MJ23's Q5 notice ran
     # on into 4(b)(ii)'s row
-    targets = set()
+    # `qp_notices`: every notice on the question paper's pages, including one set where the
+    # question was with no number of its own, which no part holds (0455/12 ON21's Q22)
+    targets = set(qp_notices)
     for question in questions:
         for part in question.parts:
             if is_removed_notice(part.text):
@@ -90,6 +109,146 @@ def _mark_removed(questions, mark_scheme, joins) -> None:
                 for number, path in targets
             )
         question.removed = bool(question.parts) and all(part.removed for part in question.parts)
+    return targets
+
+
+# Less than this, all told, is instructions ("Answer all questions.", "Section A"), never
+# material to print
+_SOURCE_MATERIAL_MIN = 100.0
+
+
+def _source_material(questions, boundaries, content_pages, segments) -> list[BBox]:
+    """What's printed on the question pages before Question 1: 0680 Paper 2 opens with a map
+    and a fact sheet about the country the whole paper is about (0680/22 FM26, user-reported:
+    read as a "question 0"). Every question may use it, so a composed exam prints it before
+    the first question taken from the paper, as it would an insert."""
+    if not questions or not content_pages:
+        return []
+    first = min(questions, key=lambda q: q.question_number)
+    start = boundaries.get(f"Q{first.question_number}", (None, None))[0]
+    if start is None:
+        return []
+    first_page = min(content_pages)
+    # begun at the foot of the page before, so every page of it is read as carried over:
+    # the header band's furniture (a corner mark, the page number) is left out, as on a
+    # question's continuation page
+    begin = (first_page - 1, 10_000.0, 0.0) if first_page else (0, top_margin(HEADER_FOOTER_MARGIN), 0.0)
+    if (first_page, top_margin(HEADER_FOOTER_MARGIN)) >= start[:2]:
+        return []
+    regions = [r for r in segments(begin, start) if r.page in content_pages]
+    if sum(r.y1 - r.y0 for r in regions) < _SOURCE_MATERIAL_MIN:
+        return []
+    return regions
+
+
+def _cambridge_fingerprint(doc, footer_page: int):
+    """The paper code from the first question page's footer - or, when that page has none,
+    from the next page that does: a page taken for a question page that wasn't one (a cover
+    with no candidate boxes, 0455/23 ON18) mustn't stop the paper being read."""
+    cover = page_text(doc[0])
+    first_error = None
+    for i in [footer_page, *(i for i in range(doc.page_count) if i != footer_page)]:
+        try:
+            return parse_footer(page_text(doc[i]), cover_text=cover)
+        except FingerprintError as e:
+            first_error = first_error or e
+    raise first_error
+
+
+_QUESTION_NAMED_RE = re.compile(r"\bparts?\s+of\s+Question\s+(\d{1,2})\b", re.IGNORECASE)
+
+
+def _number_unnumbered_first_question(tier_results, text_spans) -> None:
+    """A first question printed with no number: "Answer all parts of Question 1. Refer to
+    the source material in your answers." over "(a)", "(b)"..., and "2" printing as usual
+    further on (0455/22 ON21; user-reported). Its parts came before any question number and
+    were lost, and the paper started at 2. Gives it a number at the question column on its
+    first part's line, which the paper leaves empty - only when the parts come before the
+    first number and the instruction names the question, or the first number is 2."""
+    by_tier = {r.tier: r for r in tier_results}
+    numbers, parts = by_tier.get("question"), by_tier.get("part")
+    if numbers is None or not numbers.spans or parts is None:
+        return
+    def position(span):
+        return (span.page, span.y0, span.x0)
+    first = min(numbers.spans, key=position)
+    early = [s for s in parts.spans if position(s) < position(first)]
+    if not early:
+        return
+    lead = min(early, key=position)
+    first_number = int(first.text.strip(" ."))
+    named = [
+        int(m.group(1)) for t in text_spans
+        if t.position < position(lead) and (m := _QUESTION_NAMED_RE.search(t.text))
+    ]
+    number = named[-1] if named else (1 if first_number == 2 else None)
+    if number is None or number >= first_number:
+        return
+    x = numbers.x0_center if numbers.x0_center is not None else first.x0
+    numbers.spans.append(first.model_copy(update={
+        "text": str(number), "x0": x, "y0": lead.y0, "page": lead.page,
+        "bbox": (x, lead.bbox[1], x, lead.bbox[3]), "origin": (x, lead.origin[1]),
+        "follows_marker": False,
+    }))
+
+
+def _qp_removal_notices(doc) -> set[tuple[int, str]]:
+    """What each removal notice on the question paper names ("Due to an issue with
+    Question 22")."""
+    found = set()
+    for page in doc:
+        text = page_text(page)
+        for notice in re.finditer(r"Due to an issue with[^.]*\.[^.]*\.", text, re.IGNORECASE | re.DOTALL):
+            if is_removed_notice(" ".join(notice.group(0).split())):
+                target = removed_target(notice.group(0))
+                if target is not None:
+                    found.add(target)
+    return found
+
+
+def _drop_withdrawn(questions, mark_scheme, joins, targets=()):
+    """What the board withdrew isn't kept at all (user-decided: it may have left the
+    syllabus): the part or question goes, with its scheme rows and joins. A question that
+    keeps other parts is worth what they're worth - 0620/32 FM26 Q3 prints "[Total: 14]"
+    over 3(d)(iv)'s withdrawn mark, and is 13. Returns the questions, rows and joins kept,
+    and labels of what went ("3(d)(iv)", "5") for the checks and the Reviewer."""
+    def format_label(number: int, path: str) -> str:
+        return f"{number}" + "".join(f"({piece})" for piece in path.split(".") if piece)
+
+    gone_parts: set[str] = set()
+    withdrawn: list[str] = []
+    kept_questions = []
+    for question in questions:
+        removed = [p for p in question.parts if p.removed]
+        if not removed:
+            kept_questions.append(question)
+            continue
+        gone_parts |= {p.id for p in removed}
+        if question.removed:
+            withdrawn.append(str(question.question_number))
+            continue
+        withdrawn += [format_label(question.question_number, p.path) for p in removed]
+        question.parts = [p for p in question.parts if not p.removed]
+        question.total_marks = min(question.total_marks, sum(p.marks for p in question.parts)) or question.total_marks
+        kept_questions.append(question)
+    gone_numbers = {q.question_number for q in questions if q.removed}
+    gone_rows = {j.mark_scheme_entry_id for j in joins if j.part_id in gone_parts}
+    still_joined = {j.mark_scheme_entry_id for j in joins if j.part_id not in gone_parts}
+    kept_rows = [
+        e for e in mark_scheme
+        # a notice row goes - unless a kept part's answer shares it: 0478/22 MJ23's Q5 notice
+        # runs on into 4(b)(ii)'s row
+        if (not is_removed_notice(e.answer_text) or e.id in still_joined)
+        and e.question_number not in gone_numbers
+        and (e.id not in gone_rows or e.id in still_joined)
+    ]
+    # a whole question withdrawn with no number left on the paper - only its notice, or a
+    # "Question Discounted" scheme row - is still withdrawn, not missing (0455/12 ON21 Q22)
+    printed = {q.question_number for q in questions}
+    withdrawn += [str(n) for n, path in sorted(targets) if not path and n not in printed and str(n) not in withdrawn]
+    ids = {e.id for e in kept_rows}
+    kept_joins = [j for j in joins if j.part_id not in gone_parts and j.mark_scheme_entry_id in ids]
+    return kept_questions, kept_rows, kept_joins, withdrawn
 
 
 def _without_stray_question_rows(questions, mark_scheme, joins) -> list:
@@ -172,13 +331,13 @@ def _question_document(doc, content_pages: set[int]) -> set[int]:
     reference) and keep the question pages of the document that prints the marks."""
     covers = [
         i for i in range(1, doc.page_count)
-        if sum(word in doc[i].get_text("text").lower() for word in _COVER_WORDS) >= 3
+        if sum(word in page_text(doc[i]).lower() for word in _COVER_WORDS) >= 3
     ]
     if not covers:
         return content_pages
     bounds = [0, *covers, doc.page_count]
     documents = [set(range(a, b)) & content_pages for a, b in zip(bounds, bounds[1:])]
-    marks = [sum(len(_PRINTED_MARK_RE.findall(doc[i].get_text("text"))) for i in pages) for pages in documents]
+    marks = [sum(len(_PRINTED_MARK_RE.findall(page_text(doc[i]))) for i in pages) for pages in documents]
     best = max(range(len(documents)), key=lambda k: marks[k])
     return documents[best] if marks[best] > 0 else content_pages
 
@@ -298,32 +457,56 @@ def _join_unsplit_groups(
             if split and any(row_marks.get((question.question_number, p.path), 0) for p in siblings[:-1]):
                 continue  # the scheme splits it, marks and all
             if siblings[-1].marks <= 0 or any(p.marks for p in siblings[:-1]):
-                continue  # the paper splits it
-            first, last = siblings[0], siblings[-1]
-            merged = first.model_copy(
-                update={
-                    "id": f"{question.question_number}.{parent}",
-                    "path": parent,
-                    "depth": parent.count(".") + 1,
-                    "text": " ".join(p.text for p in siblings),
-                    "marks": last.marks,
-                    "marks_printed": last.marks_printed,
-                    "body_image_path": "",
-                    "body_segments": [],
-                    "body_label_bbox": None,
-                }
-            )
-            start = boundaries.get(first.id, (None, None))[0]
-            end = boundaries.get(last.id, (None, None))[1]
-            for p in siblings:
-                boundaries.pop(p.id, None)
-                boundaries.pop(f"{p.id}.body", None)
-            if start is not None and end is not None:
-                boundaries[merged.id] = (start, end)
-            index = question.parts.index(first)
-            question.parts = [p for p in question.parts if p not in siblings]
-            question.parts.insert(index, merged)
+                # the paper splits it - but maybe not all of it: (c)(i) and (c)(ii) under one
+                # "[1]", then (c)(iii) with its own, and the scheme's "2(c)" row for the first
+                # two (0625/51 MJ18; 0625/51 ON17 3(d)) - (c)(i) took that row's mark too
+                if (question.question_number, parent) in rows:
+                    for run in _unmarked_runs(siblings, rows, question.question_number):
+                        _merge_parts(question, run, run[0].path, boundaries)
+                continue
+            _merge_parts(question, siblings, parent, boundaries)
             question.container_headings = [h for h in question.container_headings if h.path != parent]
+
+
+def _unmarked_runs(siblings: list[QuestionPart], rows: set, question_number: int) -> list[list[QuestionPart]]:
+    """Runs of two or more subparts printing no mark, closed by one that does, none with a
+    scheme row of its own."""
+    runs, current = [], []
+    for part in siblings:
+        current.append(part)
+        if part.marks > 0:
+            if len(current) >= 2 and not any((question_number, p.path) in rows for p in current):
+                runs.append(current)
+            current = []
+    return runs
+
+
+def _merge_parts(question: Question, siblings: list[QuestionPart], path: str, boundaries: dict) -> None:
+    """`siblings` become one part at `path`, worth the mark printed on the last."""
+    first, last = siblings[0], siblings[-1]
+    merged = first.model_copy(
+        update={
+            "id": f"{question.question_number}.{path}",
+            "path": path,
+            "depth": path.count(".") + 1,
+            "text": " ".join(p.text for p in siblings),
+            "marks": last.marks,
+            "marks_printed": last.marks_printed,
+            "body_image_path": "",
+            "body_segments": [],
+            "body_label_bbox": None,
+        }
+    )
+    start = boundaries.get(first.id, (None, None))[0]
+    end = boundaries.get(last.id, (None, None))[1]
+    for p in siblings:
+        boundaries.pop(p.id, None)
+        boundaries.pop(f"{p.id}.body", None)
+    if start is not None and end is not None:
+        boundaries[merged.id] = (start, end)
+    index = question.parts.index(first)
+    question.parts = [p for p in question.parts if p not in siblings]
+    question.parts.insert(index, merged)
 
 
 def apply_hand_links(paper: Paper, paper_dir: Path) -> Paper:
@@ -366,7 +549,14 @@ def run_extraction(qp_path: Path, ms_path: Path, out_dir: Path) -> tuple[Paper, 
             for span in spans:
                 span.x0 -= shifts.get(span.page, 0.0)
             text_spans = edexcel.normalise_marks(text_spans)
+        else:
+            # a page whose markers are set off together (0610/42 ON20 p.7) - see the function
+            marker_shifts = marker_page_shifts(spans)
+            for span in spans:
+                span.x0 -= marker_shifts.get(span.page, 0.0)
+            place_moved_numbers(spans)
         tier_results = resolve_tiers(spans)
+        _number_unnumbered_first_question(tier_results, text_spans)
 
         boundaries: dict[str, tuple] = {}
         questions = tree.build_tree(tier_results, text_spans, boundaries_out=boundaries)
@@ -378,32 +568,34 @@ def run_extraction(qp_path: Path, ms_path: Path, out_dir: Path) -> tuple[Paper, 
             # cover (qbx/edexcel.py)
             fp = edexcel.fingerprint(
                 qp_path,
-                "\n".join(doc[i].get_text("text") for i in range(min(2, doc.page_count))),
-                "\n".join(page.get_text("text") for page in doc),
+                "\n".join(page_text(doc[i]) for i in range(min(2, doc.page_count))),
+                "\n".join(page_text(page) for page in doc),
                 ms_identity,
             )
         else:
-            fp = parse_footer(doc[footer_page].get_text("text"), cover_text=doc[0].get_text("text"))
+            fp = _cambridge_fingerprint(doc, footer_page)
 
         cover_page = next(
             (i for i, pt in enumerate(page_types) if pt == PageType.COVER), None
         )
         cover_total = None
+        questions_answered = None
         cover_pages = None
         subject_name, paper_title = read_cover_titles(
-            doc[cover_page if cover_page is not None else 0].get_text("text"),
+            page_text(doc[cover_page if cover_page is not None else 0]),
             fp.subject, fp.paper, fp.variant,
         )
         if is_edexcel:
             with pymupdf.open(ms_path) as ms_doc:
-                ms_cover = ms_doc[0].get_text("text") if ms_doc.page_count else ""
+                ms_cover = page_text(ms_doc[0]) if ms_doc.page_count else ""
             subject_name = edexcel.subject_name(ms_cover) or (
-                "Chemistry" if "chemistry" in doc[0].get_text("text").lower() else ""
+                "Chemistry" if "chemistry" in page_text(doc[0]).lower() else ""
             )
             paper_title = f"Paper {fp.paper}{fp.variant}"
         if cover_page is not None:
-            cover_total = read_cover_total(doc[cover_page].get_text("text"))
-            pages = _COVER_PAGES_RE.search(doc[cover_page].get_text("text"))
+            cover_total = read_cover_total(page_text(doc[cover_page]))
+            questions_answered = read_questions_answered(page_text(doc[cover_page]))
+            pages = _COVER_PAGES_RE.search(page_text(doc[cover_page]))
             cover_pages = int(pages.group(1)) if pages else None
 
         for question in questions:
@@ -418,7 +610,8 @@ def run_extraction(qp_path: Path, ms_path: Path, out_dir: Path) -> tuple[Paper, 
         joins = join.join_parts_to_mark_scheme(questions, mark_scheme)
         _backfill_marks_from_mark_scheme(questions, mark_scheme, joins)
         mark_scheme = _without_stray_question_rows(questions, mark_scheme, joins)
-        _mark_removed(questions, mark_scheme, joins)
+        targets = _mark_removed(questions, mark_scheme, joins, _qp_removal_notices(doc))
+        questions, mark_scheme, joins, withdrawn = _drop_withdrawn(questions, mark_scheme, joins, targets)
 
         paper_dir = out_dir / fp.paper_key
         assets_dir = paper_dir / "assets"
@@ -429,6 +622,8 @@ def run_extraction(qp_path: Path, ms_path: Path, out_dir: Path) -> tuple[Paper, 
                 BBox(page=p, x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1)
                 for p, r in page_segments(doc, start, end, HEADER_FOOTER_MARGIN)
             ]
+
+        source_material = _source_material(questions, boundaries, content_pages, _segments)
 
         for question in questions:
             start, end = boundaries.get(f"Q{question.question_number}", (None, None))
@@ -491,9 +686,14 @@ def run_extraction(qp_path: Path, ms_path: Path, out_dir: Path) -> tuple[Paper, 
             session=fp.session,
             year=fp.year,
             cover_total_marks=cover_total,
+            questions_answered=questions_answered,
+            withdrawn=withdrawn,
             qp_page_count=doc.page_count,
+            qp_empty_pages=empty_pages(doc),
             cover_page_count=cover_pages,
             source_qp_path=str(qp_path.resolve()),
+            needs_insert=cover_needs_insert(qp_path),
+            source_material=source_material,
             source_ms_path=str(Path(ms_path).resolve()),
             subject_name=subject_name,
             paper_title=paper_title,

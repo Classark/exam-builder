@@ -20,6 +20,7 @@ import pymupdf
 from pydantic import BaseModel
 
 from qbx import edexcel
+from qbx.anchors import page_text
 from qbx.fingerprint import NEW_CODE_RE, read_sitting
 
 _CODE_RE = re.compile(r"\b(\d{4})\s*/\s*(\d{2})\b")
@@ -76,7 +77,8 @@ def _count(signals: tuple[re.Pattern, ...], text: str) -> int:
 
 def identify(path: Path | str) -> DocumentIdentity:
     with pymupdf.open(path) as doc:
-        text = "\n".join(doc[i].get_text("text") for i in range(min(_PAGES_READ, doc.page_count)))
+        # decoded: a cover set in the shifted font read as nothing (0620/23 June 2026)
+        text = "\n".join(page_text(doc[i]) for i in range(min(_PAGES_READ, doc.page_count)))
 
     scores = {
         "mark scheme": _count(_MARK_SCHEME_SIGNALS, text),
@@ -166,7 +168,7 @@ def _identify_edexcel(path: Path | str, kind: str, text: str) -> DocumentIdentit
     found = edexcel.identify(path, text)
     if found.unit is None:  # not on the cover (January 2023): somewhere inside, then
         with pymupdf.open(path) as doc:
-            found = edexcel.identify(path, text, "\n".join(page.get_text("text") for page in doc))
+            found = edexcel.identify(path, text, "\n".join(page_text(page) for page in doc))
     if kind == "unknown":
         kind = edexcel.read_name(path).kind or "unknown"
     return DocumentIdentity(

@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
-import { AlertTriangle, ArrowUp, Download, Loader2, MessageSquarePlus, Pencil, Sparkles } from 'lucide-react'
-import { api } from './api'
+import { AlertTriangle, ArrowUp, Loader2, MessageSquarePlus, PanelLeftClose, PanelLeftOpen, Pencil, Sparkles } from 'lucide-react'
+import { api, errorMessage } from './api'
 import { PagePreview } from './PagePreview'
+import { SaveButton } from './Saving'
 import { useSourcePicker } from './SourcePicker'
 import type { ChatMessage, QuizDetail, QuizSummary } from './types'
 
@@ -37,6 +38,8 @@ export function ClaudeChat({
   const { board, sources, picker } = useSourcePicker(busy)
   const thread = useRef<HTMLDivElement>(null)
   const input = useRef<HTMLTextAreaElement>(null)
+  // the exam's question list folded away, for more of the paper's preview
+  const [wide, setWide] = useState(false)
 
   const refreshQuizzes = () => void api.listQuizzes().then(setQuizzes).catch(() => undefined)
   useEffect(refreshQuizzes, [])
@@ -57,7 +60,7 @@ export function ClaudeChat({
         setQuiz(d)
         setMessages(d.chat ?? [])
       })
-      .catch((e: unknown) => !stale && setError(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => !stale && setError(errorMessage(e)))
     return () => {
       stale = true
     }
@@ -87,7 +90,7 @@ export function ClaudeChat({
       // nothing was said: the message goes back in the box to try again
       setMessages(before)
       setDraft(text)
-      setError(e instanceof Error ? e.message : String(e))
+      setError(errorMessage(e))
     } finally {
       setBusy(false)
       input.current?.focus()
@@ -248,7 +251,14 @@ export function ClaudeChat({
       </section>
 
       {/* ── Right: the exam as it stands ── */}
-      {quiz && <ExamPanel quiz={quiz} onEditByHand={() => onEditByHand(quiz.name)} />}
+      {quiz && (
+        <ExamPanel
+          quiz={quiz}
+          wide={wide}
+          onToggleWide={() => setWide((w) => !w)}
+          onEditByHand={() => onEditByHand(quiz.name)}
+        />
+      )}
     </div>
   )
 }
@@ -313,7 +323,17 @@ function Message({ message, onOpenSettings }: { message: ChatMessage; onOpenSett
   )
 }
 
-function ExamPanel({ quiz, onEditByHand }: { quiz: QuizDetail; onEditByHand: () => void }) {
+function ExamPanel({
+  quiz,
+  wide,
+  onToggleWide,
+  onEditByHand,
+}: {
+  quiz: QuizDetail
+  wide: boolean
+  onToggleWide: () => void
+  onEditByHand: () => void
+}) {
   // numbered as printed: written questions first, then multiple choice, each from 1
   const written = quiz.items.filter((i) => !i.mcq)
   const mcq = quiz.items.filter((i) => i.mcq)
@@ -333,22 +353,24 @@ function ExamPanel({ quiz, onEditByHand }: { quiz: QuizDetail; onEditByHand: () 
 
   return (
     <aside className="card flex min-w-0 flex-1 overflow-hidden">
-      <div className="scroll-quiet w-[340px] shrink-0 space-y-3 overflow-auto border-r border-line p-4">
+      <div className={`scroll-quiet w-[340px] shrink-0 space-y-3 overflow-auto border-r border-line p-4 ${wide ? 'hidden' : ''}`}>
         <div className="flex gap-2">
-          <a
-            href={canExport ? api.exportQuizQpPdfUrl(quiz.name) : undefined}
-            aria-disabled={!canExport}
-            className={`btn-primary flex-1 justify-center whitespace-nowrap ${canExport ? '' : 'pointer-events-none opacity-50'}`}
+          <SaveButton
+            save={() => api.saveQuiz(quiz.name, 'qp')}
+            disabled={!canExport}
+            iconSize={15}
+            className="btn-primary flex-1 justify-center whitespace-nowrap disabled:opacity-50"
           >
-            <Download size={15} /> Question paper
-          </a>
-          <a
-            href={canExport ? api.exportQuizMsPdfUrl(quiz.name) : undefined}
-            aria-disabled={!canExport}
-            className={`btn-secondary flex-1 justify-center whitespace-nowrap ${canExport ? '' : 'pointer-events-none opacity-50'}`}
+            Question paper
+          </SaveButton>
+          <SaveButton
+            save={() => api.saveQuiz(quiz.name, 'ms')}
+            disabled={!canExport}
+            iconSize={15}
+            className="btn-secondary flex-1 justify-center whitespace-nowrap disabled:opacity-50"
           >
-            <Download size={15} /> Mark scheme
-          </a>
+            Mark scheme
+          </SaveButton>
         </div>
         <button className="btn-ghost w-full justify-center text-sm" onClick={onEditByHand}>
           <Pencil size={14} /> Edit by hand in the question bank
@@ -384,7 +406,17 @@ function ExamPanel({ quiz, onEditByHand }: { quiz: QuizDetail; onEditByHand: () 
             ),
         )}
       </div>
-      <div className="scroll-quiet min-w-0 flex-1 overflow-auto bg-sunken p-4">
+      <div className="scroll-quiet relative min-w-0 flex-1 overflow-auto bg-sunken p-4">
+        <div className="sticky top-0 z-10 flex h-0 justify-start">
+          <button
+            className="btn-secondary h-9 gap-1.5 px-3 text-sm shadow-sm"
+            onClick={onToggleWide}
+            title={wide ? 'Show the question list' : 'Hide the question list'}
+          >
+            {wide ? <PanelLeftOpen size={15} /> : <PanelLeftClose size={15} />}
+            {wide ? 'Show list' : 'Hide list'}
+          </button>
+        </div>
         <div className="mx-auto max-w-3xl">
           <PagePreview request={preview} empty="No questions yet." />
         </div>

@@ -115,6 +115,8 @@ class MarkSchemeEntry(BaseModel):
     # the label as printed, when markscheme._entry_ids read it as a typo for another -
     # join.py falls back to it if the corrected label matches no part
     printed_path: str | None = None
+    # other parts this one row answers, "2(a),(b)" printed as one label: ["b"]
+    also_paths: list[str] = []
     # A row linked by hand in the Reviewer (qbx/ms_links.py): where it sits on the upright
     # mark scheme pages, and its label there if it prints one - what composing copies.
     segments: list[BBox] = []
@@ -139,13 +141,28 @@ class Paper(BaseModel):
     session: str
     year: int
     cover_total_marks: int | None = None
+    # how many questions a candidate answers when the paper gives a choice ("Answer four
+    # questions in total"), else None - the cover's total counts only those (pipeline)
+    questions_answered: int | None = None
+    # what the board withdrew ("3(d)(iv)", "5"), dropped from the paper (pipeline._drop_withdrawn):
+    # the cover's and questions' printed totals still count it, so the checks allow for it
+    withdrawn: list[str] = []
     # the QP's own page count against its cover's "This document has N pages" - a file
     # missing pages loses questions no parser can recover
     qp_page_count: int | None = None
     cover_page_count: int | None = None
+    # pages (0-based) with nothing drawn on them at all (pages.empty_pages) - a damaged download
+    qp_empty_pages: list[int] = []
+    # material printed before Question 1 that the paper's questions use - 0680 Paper 2's map
+    # and fact sheet about the country studied (pipeline._source_material). Printed in a
+    # composed exam before the first question taken from the paper, like an insert.
+    source_material: list[BBox] = []
     source_qp_path: str = ""  # absolute path to the original QP PDF, for the reviewer UI
     # absolute path to the original MS PDF - a composed mark scheme copies its rows from it
     source_ms_path: str = ""
+    # the cover says it comes with an insert, a case study booklet (qbx/inserts.py); None in
+    # a paper extracted before this was read - the library reads its cover then
+    needs_insert: bool | None = None
     # as the cover prints them ("Chemistry", "Paper 4 Theory (Extended)") - the question
     # bank's subject and paper folders are labelled with these
     subject_name: str = ""

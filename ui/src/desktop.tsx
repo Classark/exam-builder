@@ -4,12 +4,13 @@ import { Copy, Minus, Square, X } from 'lucide-react'
 // What the desktop app's window offers the UI (packaging/launcher.py's Desktop, through
 // pywebview). Absent in a browser tab, so everything using it is optional.
 export interface DesktopApi {
-  open_in_browser: () => Promise<void>
   window_controls: () => Promise<boolean>
   minimize: () => Promise<void>
   toggle_maximize: () => Promise<void>
   is_maximized: () => Promise<boolean>
   close: () => Promise<void>
+  /** start a fresh copy of the app and close this one */
+  restart?: () => Promise<void>
 }
 
 declare global {

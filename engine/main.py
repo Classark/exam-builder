@@ -12,6 +12,7 @@ import asyncio
 import base64
 import functools
 import json
+import logging
 import os
 import re
 import shutil
@@ -20,14 +21,16 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import zipfile
 from pathlib import Path
 
 import pymupdf
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
-from fastapi import FastAPI, File, HTTPException, Response, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -35,7 +38,7 @@ from qbx import llm as llm_mod
 from qbx.classified import (
     ClassifiedSpec, TopicGroup, classify, in_scope, paper_label, parts_label, sitting_label, untagged_parts,
 )
-from qbx import account, ai_fix, api_key, batch_tagging, edition, legal, ms_links
+from qbx import account, api_key, app_version, batch_tagging, difficulty, edition, legal, mac_update, ms_links, saving, terms
 from qbx import fixes as fixes_mod
 from qbx.fixes import Fix, FixError, Step
 from qbx.exam_builder import ExamSource, ExamSpec, build_preferring_new
@@ -48,7 +51,7 @@ from qbx.markscheme_edexcel import scheme_layout
 from qbx.pairing import PairingError
 from qbx.pipeline import ScannedPdfError, apply_hand_links, run_extraction
 from qbx.quiz_export import QuizGroup, compose_ms_pdf, compose_qp_pdf, compose_sources_pdf, is_multiple_choice
-from qbx.scan import extract_pair, plan_scan, scan_workers
+from qbx.scan import extract_pair, lower_priority, plan_scan, scan_workers
 from qbx.snap import snap_segments
 from qbx.schema import BBox, Paper
 from qbx.tagging import merge_tags, question_needs_tagging, read_tags, tag_key, tag_questions, write_tags
@@ -67,13 +70,152 @@ RENDER_DPI = 150
 LIBRARY = Library(OUT_DIR)
 _UNSAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
 
+_log = logging.getLogger("qbx.app")
+
+# Requests being answered right now, for spotting one that never finishes. The app's window
+# opens at most 6 connections to the server, so 6 stuck requests stop every later one -
+# status polls included - and the app says its engine isn't answering while the engine
+# answers anything else at once (user-reported twice during "Re-process papers with
+# issues"; a fresh connection got /api/state in 0.01s).
+STUCK_REQUEST_SECONDS = 15.0
+_in_flight: dict[int, tuple[str, float]] = {}
+_in_flight_lock = threading.Lock()
+_in_flight_ids = iter(range(1, 1 << 62))
+
+
+class _TrackRequests:
+    """Plain ASGI middleware (not BaseHTTPMiddleware, which buffers streamed responses)."""
+
+    def __init__(self, inner) -> None:
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.inner(scope, receive, send)
+            return
+        with _in_flight_lock:
+            request_id = next(_in_flight_ids)
+            _in_flight[request_id] = (f"{scope['method']} {scope['path']}", time.monotonic())
+        try:
+            await self.inner(scope, receive, send)
+        finally:
+            with _in_flight_lock:
+                _in_flight.pop(request_id, None)
+
+
+def stuck_requests(older_than: float = STUCK_REQUEST_SECONDS) -> list[dict]:
+    now = time.monotonic()
+    with _in_flight_lock:
+        return [
+            {"request": what, "seconds": round(now - started, 1)}
+            for what, started in _in_flight.values()
+            if now - started >= older_than
+        ]
+
+
+def _watch_stuck_requests() -> None:
+    """Logs each request still running after STUCK_REQUEST_SECONDS, once, with every
+    thread's stack - what it waits on is the answer to "why did the app stop answering"."""
+    import traceback
+
+    reported: set[int] = set()
+    while True:
+        time.sleep(5)
+        now = time.monotonic()
+        with _in_flight_lock:
+            stuck = {
+                i: (what, now - started)
+                for i, (what, started) in _in_flight.items()
+                if now - started >= STUCK_REQUEST_SECONDS and i not in reported
+            }
+            reported &= set(_in_flight)
+        if not stuck:
+            continue
+        reported |= set(stuck)
+        names = {t.ident: t.name for t in threading.enumerate()}
+        stacks = "".join(
+            f"--- thread {names.get(ident, ident)}\n" + "".join(traceback.format_stack(frame)[-15:])
+            for ident, frame in sys._current_frames().items()
+        )
+        _log.error(
+            "requests still running: %s\n%s",
+            "; ".join(f"{what} ({seconds:.0f}s)" for what, seconds in stuck.values()),
+            stacks,
+        )
+
+
+threading.Thread(target=_watch_stuck_requests, daemon=True, name="stuck-requests").start()
+
+
 app = FastAPI(title="QBX Reviewer")
+app.add_middleware(_TrackRequests)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+
+@app.exception_handler(Exception)
+async def _unexpected_error(request: Request, error: Exception) -> JSONResponse:
+    """Anything a route didn't expect: the whole traceback to app.log, and a sentence for
+    the teacher - never Starlette's bare "Internal Server Error" (user-asked: errors should
+    read like a finished app's). `error_id` ties what the teacher sees to the log line."""
+    error_id = uuid.uuid4().hex[:8]
+    _log.error("unexpected error %s on %s %s", error_id, request.method, request.url.path, exc_info=error)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Something went wrong on our side. Please try again - if it keeps happening, "
+            f"the details are saved in the app's log (reference {error_id}).",
+            "error_id": error_id,
+        },
+    )
+
+
+def _job_error(what: str, error: BaseException) -> str:
+    """A background job's failure as a sentence for the teacher, its traceback to app.log
+    under a reference the sentence gives. `what` names the job: "The scan"."""
+    error_id = uuid.uuid4().hex[:8]
+    _log.error("%s failed (%s)", what, error_id, exc_info=error)
+    if isinstance(error, PermissionError):
+        reason = "a file it needed is open in another program or can't be written to - close it and try again"
+    elif isinstance(error, OSError) and getattr(error, "errno", None) == 28:
+        reason = "the disk is full"
+    elif isinstance(error, MemoryError):
+        reason = "the computer ran out of memory - close other programs and try again"
+    else:
+        reason = f"something went wrong (reference {error_id} in the app's log)"
+    return f"{what} stopped: {reason}."
+
+
+def _log_thread_crash(args: threading.ExceptHookArgs) -> None:
+    """A background thread that dies of an error nothing caught: logged, not lost."""
+    if args.exc_type is not SystemExit:
+        _log.error("thread %s crashed", getattr(args.thread, "name", "?"), exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+
+threading.excepthook = _log_thread_crash
+
+
+class ClientError(BaseModel):
+    message: str = ""
+    stack: str = ""
+    component_stack: str = ""
+    where: str = ""
+
+
+@app.post("/api/client_error")
+def log_client_error(report: ClientError) -> dict:
+    """A crash in the UI itself (its error screen sends it), so app.log has both halves."""
+    error_id = uuid.uuid4().hex[:8]
+    _log.error(
+        "UI error %s at %s: %s\n%s\n%s",
+        error_id, report.where[:200], report.message[:2000], report.stack[:8000], report.component_stack[:8000],
+    )
+    return {"error_id": error_id}
 
 
 def _paper_dir(paper_key: str) -> Path:
@@ -193,30 +335,48 @@ def get_question(paper_key: str, question_number: int) -> dict:
 _state_checked_at = 0.0
 
 
+STATE_REFRESH_SECONDS = 10.0
+
+
 @app.get("/api/state")
 def get_state() -> dict:
     """What the UI polls: `version` changes whenever any paper is added, re-extracted or
     edited, and `scan` reports a running scan's progress. Cheap - one stat per paper, at
     most once a second."""
     global _state_checked_at
-    if time.monotonic() - _state_checked_at > 1.0:
+    # Everything this app writes updates the library itself (LIBRARY.invalidate); this
+    # check only finds what changed out/ from outside it, and costs ~0.4s over 2,000+
+    # papers - once a second, that was the app's steady load while it sat open.
+    if time.monotonic() - _state_checked_at > STATE_REFRESH_SECONDS:
         _state_checked_at = time.monotonic()
         LIBRARY.refresh()
     _resume_batch_tagging()
+    _start_watching()
     with _scan_lock:
         scan = json.loads(json.dumps(_scan_state))
     with _tag_lock:
         tagging = json.loads(json.dumps(_tag_state))
-    with _fix_lock:
-        fixing = json.loads(json.dumps(_fix_state))
     with _classified_lock:  # classified booklets being composed (Classification mode)
         classified = dict(_classified_state)
     return {
         "version": LIBRARY.version, "n_papers": len(LIBRARY.summaries()),
-        "scan": scan, "tagging": tagging, "fixing": fixing, "classified": classified,
+        # papers being read into the library in the background ({done, total}, or None) -
+        # the lists fill in as it goes (qbx/library.py, INLINE_LIMIT)
+        "library": LIBRARY.progress(),
+        "scan": scan, "tagging": tagging, "classified": classified,
+        # papers with parts not yet tagged: the top bar's "Tag n papers", pressed by the teacher
+        "untagged_papers": sum(1 for s in LIBRARY.summaries() if s["n_tagged"] < s["n_parts"]),
         # debug or release build, and whether Claude can be reached at all (qbx/edition.py)
         "edition": edition.edition(), "ai": edition.claude_available(),
         "account": account.status(), "app_version": legal.version(),
+        # the oldest version Classark still allows (qbx/app_version.py): a release build
+        # older than it shows "Please update" and nothing else
+        "update": app_version.status(),
+        # a Mac copy updating itself (qbx/mac_update.py): downloading, ready to restart into,
+        # or to be downloaded by hand - None on Windows (the Store updates it) and in debug
+        "app_update": mac_update.status(),
+        # requests running for 15s+ (normally none): what a stuck window is waiting on
+        "stuck_requests": stuck_requests(),
     }
 
 
@@ -249,6 +409,50 @@ def get_source_zip() -> Response:
                     headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
+# -- saving to the teacher's folder (qbx/saving.py) ------------------------------------------
+
+
+def _saved(save) -> dict:
+    try:
+        return save()
+    except saving.SaveError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+
+
+@app.get("/api/saving")
+def saving_status() -> dict:
+    return saving.status()
+
+
+@app.put("/api/saving")
+def saving_set_folder(body: dict) -> dict:
+    """The teacher's save folder: chosen once after signing in, changeable in Settings."""
+    return _saved(lambda: saving.set_folder(str(body.get("folder") or "")))
+
+
+@app.post("/api/saving/pick")
+def saving_pick_folder() -> dict:
+    """The app window's folder dialog; {"folder": null} if cancelled or there's no window."""
+    return {"folder": saving.pick_folder()}
+
+
+@app.get("/api/saved")
+def saved_files() -> list[dict]:
+    return saving.recent()
+
+
+@app.post("/api/saved/open")
+def saved_open(body: dict) -> dict:
+    _saved(lambda: saving.open_saved(str(body.get("path") or "")))
+    return {"ok": True}
+
+
+@app.post("/api/saved/show")
+def saved_show(body: dict) -> dict:
+    _saved(lambda: saving.show_in_folder(str(body.get("path") or "")))
+    return {"ok": True}
+
+
 # -- the Classark account (qbx/account.py) -------------------------------------------------
 
 
@@ -270,14 +474,61 @@ def account_sign_out() -> dict:
     return account.status()
 
 
+@app.get("/api/account/balance")
+def account_balance() -> dict:
+    """The teacher's Claude credit, from the Classark server (amounts in micro-USD)."""
+    try:
+        return account.balance()
+    except account.AccountError as e:
+        raise HTTPException(status_code=401 if e.ended else 502, detail=str(e)) from e
+
+
 @app.post("/api/account/open/{page}")
 def account_open(page: str) -> dict:
     """Opens a Classark web page in the browser: the subscription or the credit top-up."""
-    paths = {"subscription": "/exam-builder", "credit": "/exam-builder/credit"}
+    paths = {"subscription": "/exam-builder/account", "credit": "/exam-builder/account/credit", **terms.PAGES}
     if page not in paths:
         raise HTTPException(status_code=404, detail="No such page.")
     account.open_web(paths[page])
     return {"url": account.web_url(paths[page])}
+
+
+@app.post("/api/update/open")
+def update_open() -> dict:
+    """Opens where the update is (config/app's examBuilderUpdateUrl), outside the app."""
+    url = app_version.status()["url"]
+    if not url or not url.startswith("https://"):
+        raise HTTPException(status_code=404, detail="No update link is set.")
+    account.open_url(url)
+    return {"url": url}
+
+
+@app.post("/api/update/install")
+def update_install() -> dict:
+    """Restart into the downloaded, checked update (Mac only, qbx/mac_update.py): the app
+    closes, swaps itself for the new version and opens again. The teacher's papers, exams
+    and settings aren't in the app and stay as they are."""
+    if _scan_state.get("running") or _tag_state.get("running"):
+        raise HTTPException(status_code=409, detail="Wait for the scan or tagging run to finish, then update.")
+    try:
+        mac_update.install()
+    except mac_update.UpdateError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return {"ok": True}
+
+
+@app.get("/api/terms")
+def terms_status() -> dict:
+    """Whether this computer has agreed to the current terms (qbx/terms.py)."""
+    return terms.status()
+
+
+@app.post("/api/terms/accept")
+def terms_accept(body: dict) -> dict:
+    try:
+        return terms.accept(str(body.get("version") or ""))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
 
 
 _cover_titles_cache: dict[str, tuple[str, str]] = {}
@@ -314,17 +565,58 @@ def _safe_upload_path(filename: str) -> Path:
 
 @app.post("/api/papers/upload")
 async def upload_paper(
-    qp_file: UploadFile = File(...), ms_file: UploadFile = File(...)
+    qp_file: UploadFile = File(...), ms_file: UploadFile = File(...),
+    insert_file: UploadFile | None = File(None),
 ) -> dict:
     """Saves the uploaded QP/MS into papers/ (same convention as a manually-added real
     paper) and runs the full pipeline, per CLAUDE.md's "upload-only" constraint - the tool
     only ever processes files the user hands it."""
     PAPERS_DIR.mkdir(parents=True, exist_ok=True)
-    qp_path = _safe_upload_path(qp_file.filename or "qp.pdf")
-    ms_path = _safe_upload_path(ms_file.filename or "ms.pdf")
-    qp_path.write_bytes(await qp_file.read())
-    ms_path.write_bytes(await ms_file.read())
+    with _uploads_lock:
+        _uploads[0] += 1  # the folder watcher leaves these files to this request
+    try:
+        qp_path = _safe_upload_path(qp_file.filename or "qp.pdf")
+        ms_path = _safe_upload_path(ms_file.filename or "ms.pdf")
+        qp_path.write_bytes(await qp_file.read())
+        ms_path.write_bytes(await ms_file.read())
+        _forget_removed(qp_path, ms_path, Path(qp_file.filename or ""), Path(ms_file.filename or ""))
+        insert_path = None
+        if insert_file is not None and insert_file.filename:
+            insert_path = _safe_upload_path(insert_file.filename)
+            insert_path.write_bytes(await insert_file.read())
+        result = _extract_upload(qp_path, ms_path)
+        if insert_path is not None:
+            _attach_uploaded_insert(insert_path, result["paper_key"])
+        return result
+    finally:
+        with _uploads_lock:
+            _uploads[0] -= 1
 
+
+def _attach_uploaded_insert(insert_path: Path, paper_key: str) -> None:
+    """An insert uploaded with its paper: checked against the paper like a pair is (its
+    cover must say INSERT, for this paper), then attached. A wrong file is removed and
+    refused - the paper itself stays extracted."""
+    from qbx import inserts
+    from qbx.pairing import identify
+    from qbx.scan import paper_key as key_of
+
+    try:
+        identity = identify(insert_path)
+    except Exception:
+        identity = None
+    if identity is None or identity.kind != "insert" or key_of(identity) != paper_key:
+        insert_path.unlink(missing_ok=True)
+        what = "isn't an insert" if identity is None or identity.kind != "insert" else f"is the insert for {key_of(identity)}"
+        raise HTTPException(
+            status_code=400,
+            detail=f"The paper was added, but {insert_path.name} {what}, not {paper_key}'s - it wasn't attached.",
+        )
+    inserts.attach(OUT_DIR, paper_key, insert_path)
+    LIBRARY.version += 1
+
+
+def _extract_upload(qp_path: Path, ms_path: Path) -> dict:
     try:
         paper, report = run_extraction(qp_path, ms_path, OUT_DIR)
     except PairingError as e:
@@ -384,11 +676,21 @@ def _run_scan(reprocess: bool) -> None:
             progress=lambda done, total: update(stage=f"Pairing the PDFs in the papers folder ({done} of {total})"),
             cache_path=OUT_DIR / ".qbx-pairing.json",
         )
+        from qbx import inserts
+
+        before = inserts.index(OUT_DIR)
+        inserts.save_index(OUT_DIR, plan.inserts)
+        if inserts.index(OUT_DIR) != before:
+            LIBRARY.version += 1  # an insert found or gone: the papers' badges change
+        removed = _removed_pdfs()
         todo = [
             pair
             for pair in plan.pairs
-            if not (OUT_DIR / pair.paper_key / "paper.json").exists()
-            or (reprocess and _has_issues(OUT_DIR / pair.paper_key))
+            if (
+                not (OUT_DIR / pair.paper_key / "paper.json").exists()
+                or (reprocess and _has_issues(OUT_DIR / pair.paper_key))
+            )
+            and not {pair.qp_path.name.lower(), pair.ms_path.name.lower()} & removed
         ]
         update(
             stage="Extracting",
@@ -427,7 +729,7 @@ def _run_scan(reprocess: bool) -> None:
         else:
             running = pending[:workers]
             update(current=f"{running[0]} +{len(running) - 1} more")
-            with ProcessPoolExecutor(max_workers=workers) as pool:
+            with ProcessPoolExecutor(max_workers=workers, initializer=lower_priority) as pool:
                 futures = {pool.submit(extract_pair, pair.qp_path, pair.ms_path, OUT_DIR): pair for pair in todo}
                 for future in as_completed(futures):
                     try:
@@ -436,10 +738,152 @@ def _run_scan(reprocess: bool) -> None:
                         result = {"error": f"unexpected error: {type(e).__name__}: {e}"}
                     finished(futures[future], result)
     except Exception as e:
-        update(error=f"{type(e).__name__}: {e}")
+        update(error=_job_error("The scan", e))
     finally:
         update(running=False, current=None, stage="Finished", finished_at=time.time())
         LIBRARY.refresh()
+        LIBRARY.flush()
+        _save_scan_report()
+        # Tagging never starts by itself (user-decided): the top bar offers "Tag n papers"
+        # (/api/state's untagged_papers) and the teacher presses it - nothing is sent to
+        # Claude, or charged, before that.
+
+
+# The last scan's report, kept on disk so "Last scan's results" opens it any time, even
+# after a restart (user-asked). Two copies: the latest scan (what the folder holds now -
+# its unpaired files and skipped pairs) and the latest that extracted or failed something,
+# since the folder watcher's own scans usually find nothing new and would hide it.
+_SCAN_REPORT_FILE = ".qbx-last-scan.json"
+
+
+def _save_scan_report() -> None:
+    with _scan_lock:
+        latest = json.loads(json.dumps(_scan_state))
+    path = OUT_DIR / _SCAN_REPORT_FILE
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, ValueError):
+        saved = {}
+    saved["latest"] = latest
+    if latest.get("processed") or latest.get("failed") or latest.get("error"):
+        saved["with_work"] = latest
+    try:
+        path.write_text(json.dumps(saved), encoding="utf-8")
+    except OSError:
+        pass  # a report we couldn't keep isn't worth failing the scan over
+
+
+@app.get("/api/papers/scan/last")
+def last_scan_report() -> dict:
+    """The last scan's report: what the latest scan that extracted something did, with what
+    the folder holds now (unpaired files, pairs already done) from the latest scan of all.
+    404 before any scan has finished."""
+    try:
+        saved = json.loads((OUT_DIR / _SCAN_REPORT_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    latest = saved.get("latest")
+    if not latest:
+        raise HTTPException(status_code=404, detail="No scan has finished yet.")
+    report = dict(saved.get("with_work") or latest)
+    report.update(unpaired=latest.get("unpaired", []), skipped=latest.get("skipped", []), checked_at=latest.get("finished_at"))
+    return report
+
+
+# --- Watching the papers folder (user-asked: no Scan button, papers appear by themselves) --
+#
+# A thread polls the papers folder's PDFs (name, size, modified time - a stat each, ~0.1s
+# for 2,000 files) and starts a scan when they've changed and then stayed the same for one
+# more look, so a folder still being copied in isn't scanned half-written. It scans once at
+# start too. Moves are included: a scan re-reads only files it hasn't seen at that path.
+# It never starts tagging: the teacher confirms that (see _run_scan).
+
+WATCH_SECONDS = 3.0
+_uploads = [0]  # "Add one paper" requests writing into the papers folder right now
+_uploads_lock = threading.Lock()
+_watch_started = False
+_watch_lock = threading.Lock()
+_REMOVED_FILE = ".qbx-removed.json"
+
+
+def _papers_signature() -> frozenset:
+    """Every PDF under papers/ with its size and modified time. Read from the folder
+    listings, which carry both (free on Windows): a stat per file took 0.58s over 4,787
+    PDFs, every WATCH_SECONDS while the app was open."""
+    found = set()
+    folders = [str(PAPERS_DIR)] if PAPERS_DIR.is_dir() else []
+    while folders:
+        try:
+            entries = list(os.scandir(folders.pop()))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_dir():
+                    folders.append(entry.path)
+                elif entry.name.lower().endswith(".pdf"):
+                    st = entry.stat()
+                    found.add((entry.path, st.st_size, st.st_mtime_ns))
+            except OSError:
+                continue
+    return frozenset(found)
+
+
+def _watch_papers() -> None:
+    scanned = None  # the folder as the last scan found it; None scans at start
+    seen = None
+    while True:
+        try:
+            if _scan_state.get("running"):
+                # nothing to compare while a scan runs: it reads the folder itself
+                time.sleep(WATCH_SECONDS)
+                continue
+            now = _papers_signature()
+            busy = _uploads[0] > 0
+            if not busy and now != scanned and now == seen:
+                scanned = now
+                scan_papers()
+            seen = now
+        except Exception:
+            pass  # a folder mid-rename, a locked file: look again next time
+        time.sleep(WATCH_SECONDS)
+
+
+def _start_watching() -> None:
+    """Started by the first /api/state, so only a running app watches (never a test or the
+    CLI); QBX_WATCH_PAPERS=0 turns it off."""
+    global _watch_started
+    if os.environ.get("QBX_WATCH_PAPERS", "1") == "0":
+        return
+    with _watch_lock:
+        if _watch_started:
+            return
+        _watch_started = True
+    threading.Thread(target=_watch_papers, daemon=True, name="papers-watcher").start()
+
+
+def _removed_pdfs() -> set[str]:
+    """PDF names of papers deleted from the bank with their PDFs kept: never scanned again
+    until the teacher adds the paper by hand."""
+    try:
+        return set(json.loads((OUT_DIR / _REMOVED_FILE).read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return set()
+
+
+def _write_removed(names: set[str]) -> None:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    (OUT_DIR / _REMOVED_FILE).write_text(json.dumps(sorted(names)), encoding="utf-8")
+
+
+def _remember_removed(*paths: str | None) -> None:
+    _write_removed(_removed_pdfs() | {Path(p).name.lower() for p in paths if p})
+
+
+def _forget_removed(*paths: Path) -> None:
+    names = _removed_pdfs()
+    if names & {p.name.lower() for p in paths}:
+        _write_removed(names - {p.name.lower() for p in paths})
 
 
 @app.post("/api/papers/open_folder")
@@ -625,9 +1069,9 @@ def get_asset(paper_key: str, asset_path: str) -> Response:
     return Response(content=file_path.read_bytes(), media_type="image/svg+xml")
 
 
-def _manual_fix(paper_key: str, steps: list[Step]) -> Paper:
+def _apply_manual(paper_key: str, steps: list[Step]) -> tuple[Paper, Fix]:
     """Applies a Reviewer edit as a fix (qbx/fixes.py), so a re-extraction keeps it and it
-    can be undone."""
+    can be undone - the fix comes back too, for the Reviewer's Undo."""
     paper_dir = _paper_dir(paper_key)
     paper = _load_paper(paper_key)
     if fixes_mod.read_base(paper_dir) is None:
@@ -639,7 +1083,35 @@ def _manual_fix(paper_key: str, steps: list[Step]) -> Paper:
         raise HTTPException(status_code=400, detail=str(e)) from e
     fixes_mod.write_fixes(paper_dir, fixes_mod.read_fixes(paper_dir) + [fix])
     _save_paper(paper_key, paper)
-    return paper
+    return paper, fix
+
+
+# What the Reviewer may change by hand through /edit: every fix step that edits the paper.
+# Not link_region (a drawn link goes through ms_link, which keeps it across re-extraction
+# on its own) and not Claude's notes.
+_EDIT_OPS = {
+    "link", "unlink", "relabel_entry", "merge_parts", "edit_part", "split_part", "add_part",
+    "delete_part", "set_marks", "set_total", "set_entry_marks", "delete_entry",
+    "set_cover_total", "renumber_question", "delete_question", "add_question", "withdraw_question",
+}
+
+
+@app.post("/api/papers/{paper_key}/edit")
+def edit_paper(paper_key: str, body: dict) -> dict:
+    """Any Reviewer edit, as fix steps ({"steps": [...]}), applied together as one fix -
+    kept across re-extraction and undone in one go. Returns the fix's id for Undo."""
+    raw = body.get("steps") or []
+    if not raw:
+        raise HTTPException(status_code=400, detail="Nothing to change.")
+    try:
+        steps = [Step(**s) for s in raw]
+    except Exception as e:  # pydantic: an unknown op or a malformed field
+        raise HTTPException(status_code=400, detail=f"Not a change the Reviewer can make: {e}") from e
+    refused = sorted({s.op for s in steps} - _EDIT_OPS)
+    if refused:
+        raise HTTPException(status_code=400, detail=f"Not a change the Reviewer can make: {', '.join(refused)}")
+    _, fix = _apply_manual(paper_key, steps)
+    return {"fix_id": fix.id}
 
 
 @app.patch("/api/papers/{paper_key}/parts/{part_id}")
@@ -647,10 +1119,10 @@ def update_part(paper_key: str, part_id: str, updates: dict) -> dict:
     if _find_part(_load_paper(paper_key), part_id)[2] is None:
         raise HTTPException(status_code=404, detail=f"no such part: {part_id}")
     fields = {k: updates[k] for k in ("text", "marks", "path", "segments") if k in updates}
-    paper = _manual_fix(paper_key, [Step(op="edit_part", part_id=part_id, fields=fields)])
+    paper, fix = _apply_manual(paper_key, [Step(op="edit_part", part_id=part_id, fields=fields)])
     new_id = f"{part_id.split('.', 1)[0]}.{fields['path']}" if "path" in fields else part_id
     _, _, part = _find_part(paper, new_id)
-    return (part or _find_part(paper, part_id)[2]).model_dump()
+    return {**(part or _find_part(paper, part_id)[2]).model_dump(), "fix_id": fix.id}
 
 
 @app.post("/api/papers/{paper_key}/snap")
@@ -671,9 +1143,9 @@ def set_question_total(paper_key: str, question_number: int, body: dict) -> dict
     value = body.get("total")
     if not isinstance(value, int) or value < 0:
         raise HTTPException(status_code=400, detail="The total must be a whole number.")
-    paper = _manual_fix(paper_key, [Step(op="set_total", question_number=question_number, value=value)])
+    paper, fix = _apply_manual(paper_key, [Step(op="set_total", question_number=question_number, value=value)])
     question = next(q for q in paper.questions if q.question_number == question_number)
-    return {"question_number": question_number, "total_marks": question.total_marks}
+    return {"question_number": question_number, "total_marks": question.total_marks, "fix_id": fix.id}
 
 
 @app.post("/api/papers/{paper_key}/parts/{part_id}/merge")
@@ -684,10 +1156,10 @@ def merge_parts(paper_key: str, part_id: str) -> dict:
         raise HTTPException(status_code=404, detail=f"no such part: {part_id}")
     if index + 1 >= len(question.parts):
         raise HTTPException(status_code=400, detail="no next part to merge with")
-    paper = _manual_fix(
+    paper, fix = _apply_manual(
         paper_key, [Step(op="merge_parts", part_ids=[part_id, question.parts[index + 1].id])]
     )
-    return _find_part(paper, part_id)[2].model_dump()
+    return {**_find_part(paper, part_id)[2].model_dump(), "fix_id": fix.id}
 
 
 @app.post("/api/papers/{paper_key}/parts/{part_id}/split")
@@ -698,10 +1170,11 @@ def split_part(paper_key: str, part_id: str, at: dict) -> dict:
     """
     if _find_part(_load_paper(paper_key), part_id)[2] is None:
         raise HTTPException(status_code=404, detail=f"no such part: {part_id}")
-    paper = _manual_fix(paper_key, [Step(op="split_part", part_id=part_id, at={"page": at["page"], "y": at["y"]})])
+    paper, fix = _apply_manual(paper_key, [Step(op="split_part", part_id=part_id, at={"page": at["page"], "y": at["y"]})])
     return {
         "first": _find_part(paper, part_id)[2].model_dump(),
         "second": _find_part(paper, f"{part_id}-split")[2].model_dump(),
+        "fix_id": fix.id,
     }
 
 
@@ -938,8 +1411,8 @@ def delete_paper(paper_key: str, delete_pdfs: bool = True) -> dict:
     paper_dir = _paper_dir(paper_key)
     if paper_dir.resolve().parent != OUT_DIR.resolve():
         raise HTTPException(status_code=400, detail="That isn't a paper in the bank.")
-    if _scan_state.get("running") or _tag_state.get("running") or _fix_state.get("running"):
-        raise HTTPException(status_code=409, detail="Wait for the scan, tagging or fixing run to finish, then delete.")
+    if _scan_state.get("running") or _tag_state.get("running"):
+        raise HTTPException(status_code=409, detail="Wait for the scan or tagging run to finish, then delete.")
     paper = _load_paper(paper_key)
     removed_pdfs, kept_pdfs = [], []
     if delete_pdfs:
@@ -953,6 +1426,9 @@ def delete_paper(paper_key: str, delete_pdfs: bool = True) -> dict:
                 removed_pdfs.append(path.name)
             elif path.exists():
                 kept_pdfs.append(str(path))
+    else:
+        # its PDFs stay in the papers folder: the folder watcher mustn't add it straight back
+        _remember_removed(paper.source_qp_path, paper.source_ms_path)
     shutil.rmtree(paper_dir)
     LIBRARY.invalidate(paper_key)
     return {"deleted": paper_key, "removed_pdfs": removed_pdfs, "kept_pdfs": kept_pdfs}
@@ -968,17 +1444,14 @@ def reprocess_paper(paper_key: str) -> dict:
         raise HTTPException(status_code=400, detail="That isn't a paper in the bank.")
     if _scan_state.get("running") or _tag_state.get("running"):
         raise HTTPException(status_code=409, detail="Wait for the scan or tagging run to finish, then re-process.")
-    if _fix_state.get("running") and _fix_state.get("paper_key") in (None, paper_key):
-        raise HTTPException(status_code=409, detail="Claude is reviewing this paper - wait for it to finish.")
     paper = _load_paper(paper_key)
     qp, ms = Path(paper.source_qp_path or ""), Path(paper.source_ms_path or "")
     if not (paper.source_qp_path and qp.is_file() and paper.source_ms_path and ms.is_file()):
         raise HTTPException(status_code=409, detail="This paper's PDFs aren't where they were - scan the papers folder instead.")
-    with _review_lock(paper_key):
-        try:
-            paper, report = run_extraction(qp, ms, OUT_DIR)
-        except (ScannedPdfError, FingerprintError, PairingError) as e:
-            raise HTTPException(status_code=400, detail=str(e))
+    try:
+        paper, report = run_extraction(qp, ms, OUT_DIR)
+    except (ScannedPdfError, FingerprintError, PairingError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
     LIBRARY.invalidate(paper.paper_key)
     return {"paper_key": paper.paper_key, "passed": report.passed, "n_issues": len(report.issues)}
 
@@ -1072,6 +1545,33 @@ def export_quiz_ms(name: str, footer_note: str = "") -> Response:
     )
 
 
+@app.post("/api/quizzes/{name}/save")
+def save_quiz(name: str, body: dict | None = None) -> dict:
+    """Writes the exam into its folder in the save folder (qbx/saving.py): `kind` "qp" (the
+    question paper and its sources list) or "ms". A changed exam's last save moves to Old
+    versions first."""
+    body = body or {}
+    quiz = _load_quiz(name)
+    if not quiz.items:
+        raise HTTPException(status_code=400, detail="Add a question to this exam first.")
+    footer_note = str(body.get("footer_note") or "")
+    duration = body.get("duration_minutes")
+    duration = int(duration) if duration else quiz.duration_minutes
+    groups = _quiz_groups(quiz)
+    title = saving.safe_name(quiz.name)
+    if body.get("kind") == "ms":
+        files = {f"{title} - Mark scheme.pdf": compose_ms_pdf(groups, OUT_DIR, title=quiz.name, footer_note=footer_note)}
+    else:
+        files = {
+            f"{title} - Question paper.pdf": compose_qp_pdf(
+                groups, OUT_DIR, title=quiz.name, duration_minutes=duration, footer_note=footer_note),
+            f"{title} - Sources.pdf": compose_sources_pdf(groups, OUT_DIR, title=quiz.name, footer_note=footer_note),
+        }
+    # what makes two saves the same exam: its questions, time and footer
+    content = {"items": [i.model_dump() for i in quiz.items], "duration": duration, "footer": footer_note}
+    return _saved(lambda: saving.save_files("exam", quiz.name, None, files, saving.fingerprint(content)))
+
+
 @app.get("/api/quizzes/{name}/export_sources.pdf")
 def export_quiz_sources(name: str, footer_note: str = "") -> Response:
     """For the teacher: where each question of the exported paper was taken from, numbered
@@ -1095,7 +1595,7 @@ def _require_llm(job: str = "tag"):
     llm = llm_mod.get_llm(job)
     if llm is None:
         if not edition.claude_available():
-            raise HTTPException(status_code=400, detail="Claude isn't available in this version yet.")
+            raise HTTPException(status_code=400, detail="Sign in to your Classark account to use Claude.")
         raise HTTPException(status_code=400, detail="Switch on Claude in Settings to use this.")
     return llm
 
@@ -1115,7 +1615,7 @@ def get_settings() -> dict:
     _debug_only()
     # the API key itself never leaves the credential store: only whether it's set and its last 4
     return {
-        **llm_mod.load_settings().model_dump(), "models": llm_mod.MODELS, "max_fix_workers": llm_mod.MAX_FIX_WORKERS,
+        **llm_mod.load_settings().model_dump(), "models": llm_mod.MODELS,
         "providers": llm_mod.PROVIDERS, "api_key": api_key.api_key_status(), "key_store": api_key.backend_name(),
     }
 
@@ -1128,13 +1628,9 @@ def put_settings(body: dict) -> dict:
         s.enabled = bool(body["enabled"])
     if body.get("provider") in llm_mod.PROVIDERS:
         s.provider = body["provider"]
-    for field in ("tag_model", "request_model", "fix_model"):
+    for field in ("tag_model", "request_model"):
         if body.get(field):
             s.__setattr__(field, str(body[field]).strip())
-    if body.get("fix_mode") in ("auto", "review"):
-        s.fix_mode = body["fix_mode"]
-    if "fix_workers" in body:
-        s.fix_workers = int(body["fix_workers"])
     llm_mod.save_settings(s)
     return get_settings()
 
@@ -1214,7 +1710,7 @@ async def topics_from_syllabus(subject: str, file: UploadFile = File(...)) -> di
     (topics.read_syllabus). The result is returned for checking, not saved - the Settings
     screen saves it once it looks right."""
     _checked_subject(subject)
-    llm = _require_llm("request")  # a one-off, worth the stronger model
+    llm = _require_llm("syllabus")  # a one-off, worth the stronger model
     try:
         pages = syllabus_pages(await file.read())
     except Exception as e:
@@ -1310,7 +1806,7 @@ def _run_tagging(subject: str | None, llm) -> None:
                     _tag_state["done"] += len(numbers)
                     _tag_state["papers_done"] = _tag_state.get("papers_done", 0) + 1
     except Exception as e:
-        update(error=f"{type(e).__name__}: {e}")
+        update(error=_job_error("Tagging", e))
     finally:
         update(running=False, current=None, stage="Paused" if _tag_state.get("paused") else "Finished", finished_at=time.time())
         LIBRARY.refresh()
@@ -1371,7 +1867,7 @@ def _resume_batch_tagging() -> None:
         return
     _resume_checked = True
     try:
-        if batch_tagging.pending() and llm_mod.load_settings().provider == "api":
+        if batch_tagging.pending() and llm_mod.active_settings().provider in ("api", "classark"):
             start_tagging()
     except Exception:
         pass  # Claude off, or no key: the batch waits for the next Tag press
@@ -1405,144 +1901,13 @@ def stop_tagging() -> dict:
         return json.loads(json.dumps(_tag_state))
 
 
-# --- Claude reviewing issues (qbx/ai_fix.py, qbx/fixes.py) -----------------------------
-
-_fix_lock = threading.Lock()
-_fix_state: dict = {"running": False}
-# held while Claude reviews a paper, so "apply all" never writes one under it
-_reviewing: dict[str, threading.Lock] = {}
-
-
-def _review_lock(paper_key: str) -> threading.Lock:
-    with _fix_lock:
-        return _reviewing.setdefault(paper_key, threading.Lock())
-
-
-def _papers_with_issues(everything: bool = False) -> list[str]:
-    """Papers with open issues Claude hasn't already answered: an issue with a suggestion
-    still waiting, or a fix the teacher rejected, isn't asked about again - otherwise a
-    second "Fix all" re-reviews every paper the first one left suggestions on. A waiting
-    suggestion counts only if the fixer model of now made it: switching from Haiku to
-    Sonnet, "Fix all" skipped half the papers on Haiku's "needs a person" notes. Nor one an
-    older fixer made (`ai_fix.FIXER_VERSION`): shown the scheme's pages, Claude can now fix
-    what it could only leave a note on."""
-    LIBRARY.refresh()
-    current = llm_mod.load_settings().fix_model
-    keys = []
-    for summary in LIBRARY.summaries():
-        if summary.get("n_open", 0) <= 0:
-            continue
-        paper_dir = OUT_DIR / summary["paper_key"]
-        try:
-            paper = Paper.model_validate_json((paper_dir / "paper.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        answered = {
-            k for f in fixes_mod.read_fixes(paper_dir)
-            if f.source == "ai" and (
-                f.status == "rejected"
-                or (not everything and f.status == "suggested" and f.model == current and f.fixer == ai_fix.FIXER_VERSION)
-            )
-            for k in f.issues
-        }
-        if set(fixes_mod.open_issues(paper, fixes_mod.checked_keys(paper_dir))) - answered:
-            keys.append(summary["paper_key"])
-    return keys
-
-
-def _run_fixing(keys: list[str], only: set[str] | None, llm, mode: str) -> None:
-    def update(**changes) -> None:
-        with _fix_lock:
-            _fix_state.update(changes)
-
-    def fix_one(paper_key: str) -> dict:
-        with _review_lock(paper_key):
-            return ai_fix.review_paper(
-                llm, OUT_DIR / paper_key, mode, only, save=lambda paper: _save_paper(paper_key, paper)
-            )
-
-    try:
-        update(stage="Reviewing", papers_total=len(keys))
-        with ThreadPoolExecutor(max_workers=llm_mod.MAX_FIX_WORKERS) as pool:
-            futures, queue = {}, list(keys)
-            while queue or futures:
-                # read each time round, so changing it in Settings takes effect mid-run
-                workers = llm_mod.load_settings().fix_workers
-                while queue and len(futures) < workers and not _fix_state.get("stop"):
-                    key = queue.pop(0)
-                    futures[pool.submit(fix_one, key)] = key
-                    update(current=key)
-                if not futures:
-                    break
-                done_future = next(iter(as_completed(futures)))
-                key = futures.pop(done_future)
-                try:
-                    counts = done_future.result()
-                except llm_mod.UsageLimitError as e:
-                    # stop taking new papers: the rest would fail the same way
-                    update(stop=True, paused=str(e), resets_at=e.resets_at)
-                    with _fix_lock:
-                        _fix_state["failed"].append({"paper_key": key, "error": str(e)[:300]})
-                    continue
-                except Exception as e:
-                    with _fix_lock:
-                        _fix_state["failed"].append({"paper_key": key, "error": f"{type(e).__name__}: {e}"[:300]})
-                    continue
-                LIBRARY.invalidate(key)
-                with _fix_lock:
-                    _fix_state["papers_done"] += 1
-                    for name in ("applied", "suggested", "notes"):
-                        _fix_state[name] += counts.get(name, 0)
-    except Exception as e:
-        update(error=f"{type(e).__name__}: {e}")
-    finally:
-        update(running=False, current=None, stage="Paused" if _fix_state.get("paused") else "Finished", finished_at=time.time())
-        LIBRARY.refresh()
-
-
-@app.post("/api/fixing/start")
-def start_fixing(body: dict | None = None) -> dict:
-    """Claude reviews open issues in the background - {"paper_key": k} for one paper (with
-    "issue_key" for one issue), or nothing for every paper with open issues. Auto mode
-    (Settings) applies the fixes the checks confirm; everything else waits as a suggestion.
-    Progress in /api/state's `fixing`."""
-    body = body or {}
-    llm = _require_llm("fix")
-    mode = llm_mod.load_settings().fix_mode
-    with _scan_lock:
-        if _scan_state.get("running"):
-            raise HTTPException(status_code=409, detail="Wait for the scan to finish first.")
-    # "everything": every paper with open issues, waiting suggestions or not (user-asked: re-ask
-    # all, not just what has none) - only fixes the teacher rejected still count as answered
-    keys = [body["paper_key"]] if body.get("paper_key") else _papers_with_issues(everything=bool(body.get("everything")))
-    for key in keys:
-        _paper_dir(key)
-    only = {body["issue_key"]} if body.get("issue_key") else None
-    with _fix_lock:
-        if not _fix_state.get("running"):
-            _fix_state.clear()
-            _fix_state.update(
-                running=True, stop=False, stage="Starting", mode=mode, papers_total=len(keys), papers_done=0,
-                applied=0, suggested=0, notes=0, current=None, failed=[], paused=None, resets_at=None,
-                paper_key=body.get("paper_key"), issue_key=body.get("issue_key"), started_at=time.time(),
-            )
-            threading.Thread(target=_run_fixing, args=(keys, only, llm, mode), daemon=True).start()
-        return json.loads(json.dumps(_fix_state))
-
-
-@app.post("/api/fixing/stop")
-def stop_fixing() -> dict:
-    with _fix_lock:
-        if _fix_state.get("running"):
-            _fix_state["stop"] = True
-            _fix_state["stage"] = "Stopping"
-        return json.loads(json.dumps(_fix_state))
-
+# --- fixes: the Reviewer's edits (qbx/fixes.py) ---------------------------------------
 
 @app.get("/api/papers/{paper_key}/fixes")
 def list_fixes(paper_key: str) -> list[dict]:
-    """Every fix recorded for a paper, newest first: applied, suggested, rejected, undone."""
-    return [f.model_dump() for f in reversed(fixes_mod.read_fixes(_paper_dir(paper_key)))]
+    """Every edit recorded for a paper, newest first. Fixes Claude made before it stopped
+    fixing papers (user-decided) are left out: they no longer apply."""
+    return [f.model_dump() for f in reversed(fixes_mod.read_fixes(_paper_dir(paper_key))) if f.source != "ai"]
 
 
 def _rebuild_paper(paper_key: str) -> Paper:
@@ -1583,69 +1948,6 @@ def _mark_checked(paper_key: str, keys: list[str], checked: bool) -> None:
 
 def _only_notes(fix: Fix) -> bool:
     return all(step.op in fixes_mod.NOTES for step in fix.steps)
-
-
-@app.post("/api/papers/{paper_key}/fixes/{fix_id}/accept")
-def accept_fix(paper_key: str, fix_id: str) -> dict:
-    """Applies a suggested fix - or, for "the paper itself is wrong", marks its issues
-    checked."""
-    fix = _find_fix(paper_key, fix_id)
-    if fix.status == "applied":
-        return fix.model_dump()
-    if _only_notes(fix):
-        if any(step.op == "dismiss" for step in fix.steps):
-            _mark_checked(paper_key, fix.issues, True)
-        return _set_fix_status(paper_key, fix_id, "applied").model_dump()
-    paper_dir = _paper_dir(paper_key)
-    paper = _load_paper(paper_key)
-    try:
-        fixed = fixes_mod.apply_fix(paper, fix)
-    except FixError as e:
-        raise HTTPException(status_code=400, detail=f"This fix no longer fits the paper: {e}") from e
-    if fixes_mod.read_base(paper_dir) is None:
-        fixes_mod.write_base(paper_dir, paper)
-    fix = _set_fix_status(paper_key, fix_id, "applied")
-    _save_paper(paper_key, fixed)
-    return fix.model_dump()
-
-
-@app.post("/api/fixes/accept_all")
-def accept_all_fixes() -> dict:
-    """Applies every suggestion Claude left, in every paper, oldest first - a fix and "the
-    paper itself is wrong" alike; "needs a person" notes stay. One that no longer fits
-    after an earlier one (they can touch the same part) is left waiting. A paper Claude is
-    reviewing right now is skipped: its suggestions are about to be replaced."""
-    applied = didnt_fit = notes = 0
-    busy = []
-    for paper_dir in sorted(p for p in OUT_DIR.iterdir() if (p / "fixes.json").exists()):
-        key = paper_dir.name
-        suggested = [f for f in fixes_mod.read_fixes(paper_dir) if f.status == "suggested"]
-        waiting = [f for f in suggested if not all(s.op == "needs_person" for s in f.steps)]
-        # "needs a person" notes are never applied - counted, so the teacher is told why
-        # nothing happened (user-reported: Apply all with only notes waiting did nothing)
-        notes += len(suggested) - len(waiting)
-        if not waiting:
-            continue
-        lock = _review_lock(key)
-        if not lock.acquire(blocking=False):
-            busy.append(key)
-            continue
-        try:
-            for fix in waiting:
-                try:
-                    accept_fix(key, fix.id)
-                    applied += 1
-                except HTTPException:
-                    didnt_fit += 1
-        finally:
-            lock.release()
-    return {"applied": applied, "didnt_fit": didnt_fit, "busy": busy, "notes": notes}
-
-
-@app.post("/api/papers/{paper_key}/fixes/{fix_id}/reject")
-def reject_fix(paper_key: str, fix_id: str) -> dict:
-    _find_fix(paper_key, fix_id)
-    return _set_fix_status(paper_key, fix_id, "rejected").model_dump()
 
 
 @app.post("/api/papers/{paper_key}/fixes/{fix_id}/undo")
@@ -1750,6 +2052,8 @@ def _understood(spec: ExamSpec, topics: list[Topic]) -> str:
         bits.append(
             {"structured": "no multiple choice", "mcq": "multiple choice only", "any": "any question type"}[spec.question_style]
         )
+    if spec.difficulty in difficulty.LEVELS:
+        bits.append(difficulty.LEVELS[spec.difficulty])
     return " · ".join(bits)
 
 
@@ -1941,7 +2245,7 @@ def adjust_quiz(name: str, body: dict) -> dict:
     quiz = _load_quiz(name)
     if not quiz.items:
         raise HTTPException(status_code=400, detail="Add a question to this exam first.")
-    llm = _require_llm("request")
+    llm = _require_llm("adjust")
     LIBRARY.refresh()
     items = exam_items([i.model_dump() for i in quiz.items], dict(LIBRARY.entries()))
     spec = _spec_for(quiz, sum(i.total for i in items))
@@ -1976,6 +2280,7 @@ def adjust_quiz(name: str, body: dict) -> dict:
         new_spec = spec.model_copy(update={
             "total_marks": result.target,
             "topic_ids": list(dict.fromkeys(spec.topic_ids + adjustment.topic_ids)) if spec.topic_ids else [],
+            "difficulty": adjustment.difficulty or spec.difficulty,
         })
         quiz.request["spec"] = new_spec.model_dump()
         quiz.request["understood"] = _understood(new_spec, topics)
@@ -2013,7 +2318,7 @@ def exam_chat(body: dict) -> dict:
         raise HTTPException(status_code=400, detail=f"bad conversation: {e}") from e
     if not messages or messages[-1].role != "teacher" or not messages[-1].text.strip():
         raise HTTPException(status_code=400, detail="Type a message for Claude.")
-    llm = _require_llm("request")
+    llm = _require_llm("chat")
     LIBRARY.refresh()
     name = str(body.get("quiz") or "").strip() or None
     quiz = _load_quiz(name) if name else None
@@ -2229,7 +2534,7 @@ def _write_booklets(
     except Exception as e:  # noqa: BLE001 - reported to the UI, not lost in a thread
         path.unlink(missing_ok=True)
         with _classified_lock:
-            _classified_state.update(running=False, ready=False, current=None, error=f"{type(e).__name__}: {e}")
+            _classified_state.update(running=False, ready=False, current=None, error=_job_error("Making the booklets", e))
 
 
 @app.post("/api/classified/export")
@@ -2255,6 +2560,8 @@ def classified_export(body: dict) -> dict:
             id=job_id, running=True, ready=False, error=None, done=0,
             total=2 * sum(len(quiz_groups) for _, quiz_groups in jobs), n_topics=len(jobs),
             current=None, file_name=f"{zip_name}.zip",
+            title=" ".join(s.subject for s in spec.sources) + " topic booklets",
+            content_print=saving.fingerprint({k: v for k, v in body.items()}),
         )
         state = dict(_classified_state)
     path = _CLASSIFIED_DIR / f"{job_id}.zip"
@@ -2270,6 +2577,26 @@ def classified_export(body: dict) -> dict:
 def classified_state() -> dict:
     with _classified_lock:
         return dict(_classified_state)
+
+
+@app.post("/api/classified/save/{job_id}")
+def classified_save(job_id: int) -> dict:
+    """The finished booklets, written into the save folder's "Topic booklets" folder."""
+    with _classified_lock:
+        ready = _classified_state.get("ready") and _classified_state.get("id") == job_id
+        title = _classified_state.get("title") or "Topic booklets"
+        content_print = _classified_state.get("content_print") or ""
+    path = _CLASSIFIED_DIR / f"{job_id}.zip"
+    if not ready or not path.exists():
+        raise HTTPException(status_code=404, detail="Those booklets aren't ready, or were replaced by a later run.")
+    files = {}
+    with zipfile.ZipFile(path) as archive:
+        for member in archive.namelist():
+            stem = member.rsplit(".", 1)[0]
+            label = " - Question booklet" if stem.endswith("_qp") else " - Mark scheme" if stem.endswith("_ms") else ""
+            name = saving.safe_name(stem[:-3] if label else stem, "Topic") + label + ".pdf"
+            files[name] = archive.read(member)
+    return _saved(lambda: saving.save_files("booklets", title, "Topic booklets", files, content_print))
 
 
 @app.get("/api/classified/download/{job_id}")
@@ -2292,5 +2619,22 @@ def classified_download(job_id: int) -> Response:
 # Mounted last so every /api route above takes precedence. In development the UI is served
 # by Vite instead, and this directory usually doesn't exist.
 UI_DIR = Path(os.environ.get("QBX_UI_DIR", Path(__file__).parent.parent / "ui" / "dist")).resolve()
+
+
+class _UIFiles(StaticFiles):
+    """The built UI, with caching told apart: the page and anything not under assets/ is
+    checked with the app on every load, while assets/ (content-hashed names) keeps for a
+    year. Without this WebView2 cached index.html heuristically, by its Last-Modified, and
+    after an update kept showing the old build's page and scripts (user-reported)."""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        if path.replace("\\", "/").startswith("assets/"):
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 if (UI_DIR / "index.html").exists():
-    app.mount("/", StaticFiles(directory=UI_DIR, html=True), name="ui")
+    app.mount("/", _UIFiles(directory=UI_DIR, html=True), name="ui")

@@ -161,7 +161,7 @@ def test_a_fresh_install_and_an_old_settings_file_use_claude_code(tmp_path):
 
     llm_mod.save_settings(settings.model_copy(update={"provider": "api"}))
     assert llm_mod.load_settings().provider == "api"
-    fix = llm_mod.get_llm("fix")
+    fix = llm_mod.get_llm("request")
     assert isinstance(fix, AnthropicLLM) and fix.model == "claude-sonnet-5-5" and fix.think
 
 
@@ -458,3 +458,11 @@ def test_rate_limited_batch_submission_pauses(backend, tmp_path):
     client.post("/api/tagging/start")
     state = _wait_until(client, lambda s: not s["running"])
     assert state["stage"] == "Paused" and "rate limit" in state["paused"] and state["resets_at"] > time.time()
+
+
+def test_the_classark_client_sends_the_sdks_current_api_version():
+    # the server allows 2026-10-21 (and 2023-06-01); the app never sends temperature/top_p,
+    # which 2026-10-21 removed
+    client = llm_api.make_client("tag", classark=True, token="t")
+    assert client.default_headers["anthropic-version"] == "2026-10-21"
+    assert client.default_headers["X-Classark-Job"] == "tag"

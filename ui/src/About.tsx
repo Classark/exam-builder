@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
-import { Download, FileText, Scale } from 'lucide-react'
-import { api } from './api'
+import { FileText, Scale } from 'lucide-react'
+import { api, errorMessage } from './api'
 import { Modal } from './Modal'
 
 interface AboutInfo {
@@ -12,7 +12,8 @@ interface AboutInfo {
   notice: string
 }
 
-/** About & licences: the AGPL notice, the licence texts and this version's source code
+/** About & licences: the AGPL notice and the licence texts; this version's source code ships
+ * inside the app (no button for it, user-decided)
  * (engine/qbx/legal.py - the app is AGPL-3.0 because PyMuPDF is). */
 export function About({ onClose }: { onClose: () => void }) {
   const [info, setInfo] = useState<AboutInfo | null>(null)
@@ -24,7 +25,7 @@ export function About({ onClose }: { onClose: () => void }) {
     try {
       setText({ title, body: await load() })
     } catch (e) {
-      setText({ title, body: (e as Error).message })
+      setText({ title, body: errorMessage(e) })
     }
   }
 
@@ -44,10 +45,6 @@ export function About({ onClose }: { onClose: () => void }) {
           <div className="space-y-2 whitespace-pre-line text-ink-2">{info.notice}</div>
 
           <div className="flex flex-wrap gap-2">
-            <a className="btn-primary" href="/api/about/source.zip" download>
-              <Download size={14} />
-              Download source code
-            </a>
             <button className="btn-secondary" onClick={() => void show(info.license, api.getLicense)}>
               <Scale size={14} />
               Licence

@@ -61,6 +61,10 @@ export interface Paper {
   session: string
   year: number
   cover_total_marks: number | null
+  /** pages in the question paper PDF (older extractions may lack it) */
+  qp_page_count?: number | null
+  /** pages (0-based) with nothing on them - a damaged download */
+  qp_empty_pages?: number[]
   source_qp_path: string
   source_ms_path: string
   subject_name: string
@@ -104,6 +108,10 @@ export interface PaperSummary {
   year: number
   total_marks: number
   cover_total_marks: number | null
+  // the cover says the paper comes with an insert (Business Studies' case study), and
+  // whether the scan found it - a composed paper prints it before the paper's questions
+  needs_insert?: boolean
+  has_insert?: boolean
 }
 
 export interface BankQuestionBrief {
@@ -112,6 +120,7 @@ export interface BankQuestionBrief {
   stem: string
   n_parts: number
   topics: string[] // syllabus topic ids across its parts (tags.json), [] until tagged
+  difficulty?: number | null // 1 Easy .. 4 Very hard (Claude's rating, else an estimate)
 }
 
 export interface BankPaper extends PaperSummary {
@@ -161,16 +170,11 @@ export interface ApiKeyStatus {
 export interface Settings {
   enabled: boolean // "Use Claude"
   // "api": the Anthropic API with the user's key; "claude_code": Claude Code on this computer (testing)
-  provider: 'api' | 'claude_code'
+  provider: 'api' | 'claude_code' | 'classark'
   providers: string[]
   api_key: ApiKeyStatus
   tag_model: string
   request_model: string
-  // Claude reviewing papers' issues: "auto" applies the fixes the checks confirm
-  fix_model: string
-  fix_mode: 'auto' | 'review'
-  fix_workers: number
-  max_fix_workers: number
   models: string[]
 }
 
@@ -186,7 +190,7 @@ export interface FixStep {
   at?: Record<string, number>
 }
 
-/** A change to an extracted paper (engine qbx/fixes.py), by Claude or the teacher. */
+/** A change to an extracted paper (engine qbx/fixes.py): the teacher's edits in the Reviewer. */
 export interface Fix {
   id: string
   steps: FixStep[]
@@ -197,26 +201,6 @@ export interface Fix {
   clears: string[]
   raises: string[]
   created_at: number
-}
-
-export interface FixingState {
-  running: boolean
-  stop?: boolean
-  stage?: string
-  mode?: 'auto' | 'review'
-  paper_key?: string | null
-  issue_key?: string | null
-  papers_total?: number
-  papers_done?: number
-  applied?: number
-  suggested?: number
-  notes?: number
-  current?: string | null
-  failed?: { paper_key: string; error: string }[]
-  paused?: string | null
-  resets_at?: number | null
-  error?: string
-  finished_at?: number
 }
 
 export interface TaggingState {
@@ -276,15 +260,20 @@ export interface ScanState {
   unpaired?: { file: string; reason: string }[]
   error?: string
   finished_at?: number
+  /** "Last scan's results": when the folder was last looked at (it may be later than finished_at) */
+  checked_at?: number
 }
 
 export interface LiveState {
   version: number
   n_papers: number
+  /** papers with parts not yet tagged - the top bar's "Tag n papers" */
+  untagged_papers?: number
   scan: ScanState
   tagging: TaggingState
-  fixing?: FixingState
   classified?: ClassifiedState
+  /** papers being read into the library in the background, or null (qbx/library.py) */
+  library?: LibraryProgress | null
   /** debug (Claude Code + Settings, for testing) or release (for teachers) - qbx/edition.py */
   edition?: 'debug' | 'release'
   /** whether this build can reach Claude at all; false hides everything that needs it */
@@ -292,6 +281,32 @@ export interface LiveState {
   /** the Classark account this computer is signed in to (qbx/account.py) */
   account?: AccountState
   app_version?: string
+  update?: UpdateState
+  /** a Mac copy updating itself (engine/qbx/mac_update.py); null elsewhere */
+  app_update?: AppUpdateState | null
+}
+
+export interface LibraryProgress {
+  done: number
+  total: number
+}
+
+/** A Mac copy updating itself (engine/qbx/mac_update.py): downloading in the background,
+ * ready to restart into, or to download by hand (`error` says why). */
+export interface AppUpdateState {
+  status: 'idle' | 'downloading' | 'ready' | 'manual' | 'failed'
+  version: string | null
+  done: number
+  total: number
+  error: string | null
+}
+
+/** The oldest version Classark still allows (engine/qbx/app_version.py). */
+export interface UpdateState {
+  version: string
+  minimum: string | null
+  url: string | null
+  required: boolean
 }
 
 export interface AccountState {
@@ -440,4 +455,38 @@ export interface ChatReply {
   action: 'none' | 'make' | 'change' | 'reroll'
   // the exam open after this turn
   quiz: string | null
+}
+
+/** The teacher's Claude credit on the Classark server, in micro-USD (1 USD = 1,000,000). */
+export interface Balance {
+  currency: string
+  allowance?: { monthly_micros: number; used_micros: number; remaining_micros: number; resets_at: string }
+  topup?: { balance_micros: number }
+  reserved_micros?: number
+  available_micros: number
+  subscription_active?: boolean
+}
+
+/** Where the app saves exams (qbx/saving.py): chosen once after sign-in. */
+export interface SavingState {
+  folder: string
+  chosen: boolean
+  default: string
+  can_pick: boolean // the app window has a folder dialog; in a browser the folder is typed
+}
+
+export interface SaveResult {
+  folder: string
+  files: { name: string; path: string }[]
+  archived: string | null // the previous version's folder under "Old versions", if it moved
+  version: number
+}
+
+export interface SavedFile {
+  kind: string
+  title: string
+  name: string
+  path: string
+  saved_at: number
+  exists: boolean
 }

@@ -138,3 +138,31 @@ def test_questions_the_board_withdrew_are_marked_removed():
         (5, ""), (10, "a"), (10, "b"), (11, "a")
     ]
     assert [q.removed for q in (q4, q5, q10, q11)] == [False, True, True, False]
+
+
+def test_a_withdrawn_part_is_dropped_and_its_question_worth_the_rest():
+    # 0620/32 FM26 Q3: "[Total: 14]" counts 3(d)(iv), withdrawn
+    from qbx.pipeline import _drop_withdrawn
+    from qbx.schema import MarkSchemeEntry, Question, QuestionPart, QuestionPartMarkScheme
+
+    parts = [
+        QuestionPart(question_id="3", path=p, depth=2, text="", image_path="", marks=m, id=f"3.{p}", removed=r)
+        for p, m, r in (("d.iii", 1, False), ("d.iv", 0, True), ("d.v", 3, False))
+    ]
+    question = Question(paper_key="k", board="", subject="", question_number=3, stem_text="", stem_image_path="",
+                        total_marks=5, parts=parts)
+    rows = [MarkSchemeEntry(id=f"3.{p}", paper_key="k", question_number=3, part_path=p, answer_text="x", marks=1)
+            for p in ("d.iii", "d.iv", "d.v")]
+    joins = [QuestionPartMarkScheme(part_id=f"3.{p}", mark_scheme_entry_id=f"3.{p}") for p in ("d.iii", "d.iv", "d.v")]
+    questions, kept, kept_joins, withdrawn = _drop_withdrawn([question], rows, joins)
+    assert [p.path for p in questions[0].parts] == ["d.iii", "d.v"]
+    assert questions[0].total_marks == 4
+    assert [e.id for e in kept] == ["3.d.iii", "3.d.v"]
+    assert withdrawn == ["3(d)(iv)"]
+
+
+def test_the_engine_reads_text_boxes_uncorrected_whatever_is_installed():
+    # the exe has no pymupdf4llm to switch the correction off (0610/52 MJ16 parsed differently)
+    import pymupdf
+    import qbx  # noqa: F401
+    assert pymupdf.TOOLS.unset_quad_corrections() is True

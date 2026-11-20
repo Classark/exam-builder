@@ -490,3 +490,58 @@ def test_a_mark_glued_to_a_notes_heading(tmp_path):
     match = _MARKS_THEN_CODE_RE.match("4 Remember:")
     assert match and match.group("marks") == "4"
     assert not _MARKS_THEN_CODE_RE.match("4 Remember the units")
+
+
+def test_a_max_mark_or_a_guidance_sentence_glued_to_the_mark():
+    # 0620/61 MJ26 Q4 "max 6 Ignore ...", 0620/62 MJ26 Q4 "6 Ticks must show where marks are awarded"
+    from qbx.markscheme import _MARKS_THEN_CODE_RE
+
+    assert _MARKS_THEN_CODE_RE.match("max 6 Ignore additional steps").group("marks") == "max 6"
+    assert _MARKS_THEN_CODE_RE.match("6 Ticks must show where marks are awarded, but not").group("marks") == "6"
+
+
+def test_bracketed_marks_read_like_bare_ones():
+    # 0610 2016 schemes: "[3]", "[max 3]", "[max. 1]" in the Mark column
+    from qbx.markscheme import _unbracketed
+    assert _unbracketed("[3]") == "3"
+    assert _unbracketed("[max 3]") == "max 3"
+    assert _unbracketed("[max. 1]") == "max 1"
+    assert _unbracketed("[Total: 10]") == "[Total: 10]"
+
+
+def _span(text, x, y, page=0):
+    from qbx.markscheme import MSSpan
+    return MSSpan(text=text, page=page, x=x, y=y, bbox=(x, y, x + 20, y + 10))
+
+
+def test_part_cells_apart_from_the_number_are_filled_in():
+    # 0610/32 MJ16: "4" | "(a) (i)" in cells 48pt apart, then "(ii)" alone further down
+    from qbx.markscheme import _join_split_labels
+    spans = [
+        _span("Question", 110, 82), _span("4", 81, 106), _span("(a) (i)", 129, 106),
+        _span("(ii)", 129, 181), _span("(b)", 111, 256), _span("5", 81, 300),
+        _span("(a) (i)", 129, 300), _span("(ii)", 179, 330),  # an answer's numbering
+    ]
+    texts = [(s.text, s.x) for s in _join_split_labels(spans)]
+    assert ("4(a) (i)", 81) in texts and ("4(a)(ii)", 81) in texts and ("4(b)", 81) in texts
+    assert ("5(a) (i)", 81) in texts
+    assert ("(ii)", 179) in texts  # out in the answer column: left alone
+
+
+def test_a_page_set_off_from_the_rest_keeps_its_labels():
+    # 0610/42 MJ18 p.6 sits 25pt left of the others; a trace table's bare "0"s 27pt right
+    # of the labels on a page of their own aren't labels (0478/23 MJ24)
+    from qbx.markscheme import _leftmost_cluster
+    spans = [_span("1(a)", 102, 80, 0), _span("1(b)", 102, 200, 0), _span("2(a)", 77, 80, 1),
+             _span("3(a)", 102, 80, 2), _span("0", 130, 80, 3), _span("4(a)", 102, 80, 4)]
+    kept = {(s.page, s.text) for s in _leftmost_cluster(spans)}
+    assert (1, "2(a)") in kept and (0, "1(a)") in kept and (3, "0") not in kept
+
+
+def test_a_split_bracket_is_one_marker():
+    # 0610/31 MJ16 6(b): "(" and "b)" as two touching spans, stored apart in the file
+    from qbx.markscheme import MSSpan, _glued_brackets
+    spans = [MSSpan(text="(", page=0, x=87, y=206, bbox=(84, 206, 87.2, 216)),
+             MSSpan(text="other", page=0, x=300, y=100, bbox=(300, 100, 320, 110)),
+             MSSpan(text="b)", page=0, x=100, y=206, bbox=(87, 206, 101, 216))]
+    assert [s.text for s in _glued_brackets(spans)] == ["(b)", "other"]

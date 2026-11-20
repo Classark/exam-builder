@@ -2,9 +2,8 @@
 
 Tagging a bank is non-interactive - nobody is waiting on a given paper - so instead of a
 call per paper it sends every pending paper's tagging prompts as one Message Batch, at
-half the price of direct calls (the user's decision). Exam requests, chat, adjustments and
-fixing stay direct calls: a teacher is waiting on those, and fixing is multi-round and
-verified between rounds (moving it to batches is a follow-up).
+half the price of direct calls (the user's decision). Exam requests, chat and
+adjustments stay direct calls: a teacher is waiting on those.
 
 The flow, all inside the tagging run's background thread (main._run_tagging):
 1. A batch already submitted - recorded in config/batches.json - is collected first, so an
@@ -100,31 +99,31 @@ def _save_pending(record: dict | None) -> None:
 Work = tuple[str, list[int], int]  # paper key, question numbers, attempt
 
 
-def _api(call, *args, **kwargs):
-    import anthropic
-
-    from qbx.llm_api import map_error
-
-    try:
-        return call(*args, **kwargs)
-    except anthropic.APIError as e:
-        raise map_error(e) from e
+def _api(llm, request):
+    """`request(client)` through the LLM, which maps errors and, on Classark, renews the
+    sign-in."""
+    return llm.call(request)
 
 
 def _submit(llm, work: list[Work], hooks: Hooks) -> dict | None:
-    requests, covers = [], {}
+    requests, covers, labels = [], {}, []
     for paper_key, numbers, attempt in work:
         paper = hooks.load_paper(paper_key)
         questions = [q for q in paper.questions if q.question_number in numbers]
         for prompt, chunk in tagging_prompts(paper, questions, hooks.topics_for(paper_key)):
             custom_id = f"r{len(requests)}"  # paper keys aren't always valid custom ids
             requests.append({"custom_id": custom_id, "params": llm.params(prompt, PaperTags)})
+            labels.append(paper_key)
             covers[custom_id] = {
                 "paper_key": paper_key, "numbers": [q.question_number for q in chunk], "attempt": attempt,
             }
     if not requests:
         return None
-    batch = _api(llm.client.messages.batches.create, requests=requests)
+    extra = {}
+    if getattr(llm, "classark", False):
+        # the Classark server answers cached papers itself, free (EXAM_BUILDER_API.md §5)
+        extra = {"extra_headers": {"X-Classark-Cache": "batch"}, "extra_body": {"classark_labels": labels}}
+    batch = _api(llm, lambda c: c.messages.batches.create(requests=requests, **extra))
     record = {"batch_id": batch.id, "model": llm.model, "submitted_at": time.time(), "requests": covers}
     _save_pending(record)
     return record
@@ -134,7 +133,7 @@ def _wait(llm, record: dict, hooks: Hooks) -> bool:
     """Polls until the batch ends (True) or the run is stopped (False)."""
     total = len(record["requests"])
     while True:
-        batch = _api(llm.client.messages.batches.retrieve, record["batch_id"])
+        batch = _api(llm, lambda c: c.messages.batches.retrieve(record["batch_id"]))
         counts = batch.request_counts
         done = total - getattr(counts, "processing", 0)
         hooks.update(
@@ -159,7 +158,10 @@ def _collect(llm, record: dict, hooks: Hooks) -> list[Work]:
     covers: dict[str, dict] = record["requests"]
     seen: set[str] = set()
     again: list[Work] = []
-    for item in _api(llm.client.messages.batches.results, record["batch_id"]):
+    results = _api(llm, lambda c: list(c.messages.batches.results(record["batch_id"])))
+    for n, item in enumerate(results):
+        # saving takes a while on a big bank: say so, rather than "n of n done" standing still
+        hooks.update(stage=f"Saving Claude's tags: {n + 1} of {len(results)} papers")
         cover = covers.get(item.custom_id)
         if cover is None or item.custom_id in seen:
             continue

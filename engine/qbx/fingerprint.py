@@ -88,7 +88,11 @@ def read_sitting(text: str) -> tuple[str, int] | None:
 def parse_footer(footer_text: str, cover_text: str = "") -> Fingerprint:
     """Reads the paper code from a page footer. `cover_text` is needed only for the newer
     code layout, which leaves the session to the cover."""
-    match = _FOOTER_RE.search(footer_text)
+    # "0610/31/ 0/ N/22" (0610/31 ON22, every page): spaces after the slashes and a zero for
+    # the O - read as "0610/31/O/N/22"
+    tidied = re.sub(r"(?<=\d{4}/\d{2})/\s*0\s*/\s*N\s*/", "/O/N/", footer_text)
+    tidied = re.sub(r"(?<=\d{4}/\d{2})/\s*([MOF])\s*/\s*([JNM])\s*/\s*(?=\d{2})", r"/\1/\2/", tidied)
+    match = _FOOTER_RE.search(tidied)
     if match:
         raw = match.group(0)
         subject, paper, variant = match.group("subject"), match.group("paper"), match.group("variant")
@@ -97,7 +101,10 @@ def parse_footer(footer_text: str, cover_text: str = "") -> Fingerprint:
     else:
         new = NEW_CODE_RE.search(footer_text) or NEW_CODE_RE.search(cover_text)
         if not new:
-            raise FingerprintError(f"no paper code found in footer: {footer_text!r}")
+            raise FingerprintError(
+                "Couldn't find the paper code (like 0455/23/O/N/18) at the foot of the question "
+                "pages, so this file can't be identified. Is it a Cambridge question paper?"
+            )
         raw = new.group(0)
         subject, paper, variant = new.group("subject"), new.group("paper"), new.group("variant")
         year = int(new.group("year")) % 100
@@ -149,5 +156,15 @@ def read_cover_titles(cover_text: str, subject: str, paper: str, variant: str) -
         below = lines[index + 1] if index + 1 < len(lines) else ""
         name = above.title() if above.isupper() and re.fullmatch(r"[A-Z][A-Z &()\-–]*", above) else ""
         title = below if below.lower().startswith("paper") else ""
-        return name, " ".join(title.split())
+        if name or title:
+            return name, " ".join(title.split())
+        # the code with the sitting and the time under it, then the subject and the title:
+        # "0620/11", "May/June 2026", "45 minutes", "CHEMISTRY", "Paper 1 Multiple Choice
+        # (Core)" (every 2026 paper, 0620/12 MJ24, 0610/4x MJ16 - left untitled in the bank)
+        for offset, line in enumerate(lines[index + 1 : index + 6], start=index + 1):
+            if re.match(r"^Paper\s+\d", line):
+                above = lines[offset - 1]
+                name = above.title() if above.isupper() and re.fullmatch(r"[A-Z][A-Z &()\-–]*", above) else ""
+                return name, " ".join(line.split())
+        return "", ""
     return "", ""

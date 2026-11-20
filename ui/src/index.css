@@ -179,6 +179,13 @@
     font-feature-settings: "rlig" 1, "calt" 1;
     -webkit-font-smoothing: antialiased;
   }
+  /* the app's controls aren't text to select, as in any desktop app: a drag or double-click
+     on a button, tab or the top bar highlighted it like a web page. Content stays selectable. */
+  button, header, nav, label, summary, [role="tab"], [role="button"], [role="menuitem"], svg, img {
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  img, svg { -webkit-user-drag: none; }
   :focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
@@ -246,6 +253,9 @@
 
 /* Thin, quiet scrollbars in scrolling panes */
 .scroll-quiet { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+/* a row that scrolls sideways by its own arrows (the Reviewer's question strip) */
+.no-scrollbar { scrollbar-width: none; }
+.no-scrollbar::-webkit-scrollbar { display: none; }
 
 /* Progress sweep under the top bar while a scan runs */
 @keyframes sweep { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
@@ -265,6 +275,22 @@
 .region-highlight.is-secondary {
   border-style: dashed; background: rgba(224, 122, 95, 0.05); box-shadow: none;
 }
+/* The Reviewer's other regions, beside the selected one (.region-highlight). Drawn on the
+   always-white page, so fixed colours rather than theme tokens: the selected box is the
+   accent, a box with a problem is amber and dashed, the rest a quiet slate outline. */
+.region-box { border-radius: 4px; transition: background-color 120ms; }
+.region-box.is-plain { border: 1.5px solid rgba(71, 85, 105, 0.45); }
+.region-box.is-plain:hover { background: rgba(71, 85, 105, 0.08); }
+.region-box.is-problem { border: 2px dashed #d97706; background: rgba(217, 119, 6, 0.07); }
+.region-box.is-problem:hover { background: rgba(217, 119, 6, 0.14); }
+.region-tag {
+  position: absolute; left: -2px; top: -2px; z-index: 1;
+  border-radius: 4px 0 4px 0; padding: 0 5px;
+  font-size: 11px; font-weight: 600; line-height: 16px; white-space: nowrap; color: #fff;
+  background: rgb(71, 85, 105);
+}
+.region-box.is-problem .region-tag { background: #d97706; }
+.region-tag.is-selected { background: var(--accent); }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }

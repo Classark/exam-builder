@@ -1,26 +1,28 @@
 """The one door to a language model, and the settings that open it.
 
-Two providers (`Settings.provider`):
-- "api": the Anthropic API (`AnthropicLLM` in llm_api.py). Tagging goes through the Message
-  Batches API (batch_tagging.py), at half price. Not offered in Settings: the app takes no
-  API keys (user-decided). It's the base for the Classark account provider, which sends the
-  same requests to the Classark server (identity federation to Anthropic, no stored key).
+Three providers (`Settings.provider`):
+- "classark": the teacher's Classark account (`AnthropicLLM(classark=True)`). The same
+  Messages API requests as "api", sent to the Classark server (api.classark.com, the
+  platform repo's EXAM_BUILDER_API.md) with the account's access token; the server reaches
+  Anthropic by identity federation and charges the teacher's monthly allowance and top-ups.
+  The only provider a release build has, whenever signed in.
+- "api": the Anthropic API with an API key. Not offered in Settings: the app takes no API
+  keys (user-decided) - kept for development and tests.
 - "claude_code": Claude through the Claude Agent SDK and the Claude Code install on this
-  machine (`ClaudeLLM`). With no API key set, calls run on that machine's own Claude
-  subscription login and count against its usage limits - kept for the user and friends
-  testing on their own machines. The default, until the Classark account provider exists.
-A third, later: the user's own server proxying the API for subscribing teachers - a base
-URL and an account token, one more branch in `llm_api.make_client`.
+  machine (`ClaudeLLM`), on that machine's own Claude subscription - for the user and
+  friends testing debug builds. Debug's default.
+Tagging on "classark" and "api" goes through the Message Batches API (batch_tagging.py).
 
-Opt-in: nothing is sent until "Use Claude" is switched on in Settings. Claude has three
+Opt-in: nothing is sent until "Use Claude" is switched on in Settings. Claude has these
 jobs only (see CLAUDE.md, "AI features"), and never extracts or writes questions:
 
 - tagging question parts with syllabus topics, and which earlier parts each one needs;
 - reading a syllabus's topic headings;
 - reading a typed exam request into a spec (exam_request.py);
-- reading an instruction to change an exam into a plan (exam_adjust.py) - code picks the questions;
-- reviewing a paper's open issues and proposing fixes, which the checks then test
-  (ai_fix.py, fixes.py) - it moves, joins and numbers what the parser found, never writes it.
+- reading an instruction to change an exam into a plan (exam_adjust.py) - code picks the questions.
+
+Claude no longer fixes papers in the Reviewer (user-decided): a paper the parser gets wrong
+is fixed in the parser, or by hand.
 
 Every call asks for JSON matching a pydantic model (the SDK's structured output), so a
 reply is either valid or an error, never free text to be parsed. Tests use `FakeLLM` and
@@ -28,6 +30,8 @@ never start Claude.
 """
 
 import asyncio
+import contextlib
+import contextvars
 import datetime
 import json
 import os
@@ -51,8 +55,6 @@ MODELS = ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"]
 # what a settings.json saved before the ids were pinned holds
 _ALIASES = {"haiku": TAG_MODEL, "sonnet": REQUEST_MODEL, "opus": "claude-opus-5-5"}
 
-MAX_FIX_WORKERS = 6
-
 T = TypeVar("T", bound=BaseModel)
 
 
@@ -69,7 +71,27 @@ class UsageLimitError(LLMError):
         self.resets_at = resets_at
 
 
-PROVIDERS = ["api", "claude_code"]
+PROVIDERS = ["classark", "claude_code", "api"]
+# what each Claude call is for: the Classark server needs it on every call
+# (X-Classark-Job), and make_llm picks the model and thinking by it
+JOBS = ("tag", "request", "adjust", "chat", "syllabus")
+
+# the paper a tag call is about, for the Classark server's shared cache
+# (X-Classark-Cache: tag:<paper_key>); a context variable, so each worker thread has its own
+_cache_label: "contextvars.ContextVar[str | None]" = contextvars.ContextVar("qbx_cache_label", default=None)
+
+
+@contextlib.contextmanager
+def cache_label(paper_key: str):
+    token = _cache_label.set(paper_key)
+    try:
+        yield
+    finally:
+        _cache_label.reset(token)
+
+
+def current_cache_label() -> str | None:
+    return _cache_label.get()
 
 
 class Settings(BaseModel):
@@ -77,26 +99,11 @@ class Settings(BaseModel):
     # a fresh install uses the API; load_settings reads a file without it as claude_code
     # Claude Code until the Classark account provider exists: the app takes no API keys
     # (user-decided), so "api" is only for the server-side proxy work and tests
-    provider: Literal["api", "claude_code"] = "claude_code"
+    provider: Literal["classark", "api", "claude_code"] = "claude_code"
     tag_model: str = TAG_MODEL
     request_model: str = REQUEST_MODEL
-    # reviewing papers' issues (qbx/ai_fix.py): "auto" applies the fixes the checks confirm,
-    # "review" leaves every one for the teacher to accept
-    # Sonnet, not Haiku: fixing is reasoning (where a missed "(ii)" starts, which row is
-    # whose, do the marks add up), and once the parser cleared most papers it runs on a
-    # handful - Haiku with thinking off missed most of what it was asked
-    fix_model: str = REQUEST_MODEL
-    fix_mode: Literal["auto", "review"] = "auto"
-    # papers reviewed at once, each its own Claude Code process. More is faster until the
-    # plan's rate limit starts refusing them.
-    fix_workers: int = 2
 
-    @field_validator("fix_workers")
-    @classmethod
-    def _clamp_workers(cls, value: int) -> int:
-        return max(1, min(MAX_FIX_WORKERS, value))
-
-    @field_validator("tag_model", "request_model", "fix_model")
+    @field_validator("tag_model", "request_model")
     @classmethod
     def _pin_alias(cls, value: str) -> str:
         return _ALIASES.get(value, value)
@@ -260,31 +267,44 @@ def set_llm_override(llm: LLM | None) -> None:
 
 
 def make_llm(settings: Settings, job: str = "tag") -> LLM:
-    """The model for a job ("tag", "request" or "fix") on the settings' provider, whether or
-    not Claude is switched on (the Settings screen's "Test connection" asks before that)."""
-    if settings.provider == "api":
-        from qbx.llm_api import AnthropicLLM as make
+    """The model for a job (one of JOBS) on the settings' provider, whether or not Claude
+    is switched on (the Settings screen's "Test connection" asks before that)."""
+    if job not in JOBS:
+        raise ValueError(f"unknown Claude job {job!r}")
+    if settings.provider in ("api", "classark"):
+        from qbx.llm_api import AnthropicLLM
+
+        def make(model, think=True):
+            return AnthropicLLM(model, think=think, job=job, classark=settings.provider == "classark")
     else:
         make = ClaudeLLM
-    if job == "request":
-        # one short call per typed request, where reasoning about topics and marks pays off
-        return make(settings.request_model)
-    if job == "fix":
-        # one call per paper the parser left with issues - a handful, not a bank - so with
-        # thinking on: placing a split and checking the marks is worth it
-        return make(settings.fix_model, think=True)
-    return make(settings.tag_model, think=False)
+    if job == "tag":
+        return make(settings.tag_model, think=False)
+    # requests, changes, chat and syllabus reading: one call at a time with a teacher
+    # waiting, where reasoning about topics and marks pays off
+    return make(settings.request_model)
+
+
+def active_settings() -> Settings:
+    """The settings Claude runs on: a release build has no Settings screen, so it's always
+    the Classark account with the default models; a debug build reads settings.json."""
+    from qbx.edition import is_release
+
+    if is_release():
+        return Settings(enabled=True, provider="classark")
+    return load_settings()
 
 
 def get_llm(job: str = "tag") -> LLM | None:
-    """The model for a job ("tag", "request" or "fix"), or None while AI is switched off."""
+    """The model for a job (one of JOBS), or None while Claude isn't available: switched
+    off in a debug build's Settings, or a release build not signed in to Classark."""
     if _override is not None:
         return _override
     from qbx.edition import claude_available
 
     if not claude_available():
-        return None  # a release build: no Claude Code, and Classark accounts aren't built yet
-    settings = load_settings()
+        return None
+    settings = active_settings()
     if not settings.enabled:
         return None
     return make_llm(settings, job)

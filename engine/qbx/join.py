@@ -6,6 +6,8 @@ equality match handles the common case, but a QP/MS pair whose dotted paths are 
 each other (one side more granular than the other) must still be linked.
 """
 
+import re
+
 from qbx.schema import Question, QuestionPartMarkScheme
 
 
@@ -122,6 +124,42 @@ def _align_by_marks(parts: list, entries: list) -> list[tuple[str, int]] | None:
     return pairs
 
 
+_MARKING_POINT_RE = re.compile(r"^\s*M(\d)(?!\d)")
+
+
+def _align_by_marking_points(parts: list, entries: list) -> list[tuple[str, int]] | None:
+    """Cambridge's 2026 practical schemes give each marking point a row of its own and
+    label the rows as if the points were subparts: 0620/51 MJ26 prints 2(a)(i)'s two points
+    as rows "2(a)" M1 and "2(a)(i)" M2, and 2(a)(ii)'s three as "2(a)(ii)", "(iii)", "(iv)"
+    M1-M3 - so the labels pair the wrong rows and leave the last ones orphaned. The points'
+    numbering is right where the labels aren't: a row opening "M2", "M3"... carries on the
+    part before it, and any other row starts a part. Pair those groups with the paper's
+    parts in order - only when there are as many groups as parts and every part's printed
+    mark matches its group (a row of marking points, one mark each; any other row its own
+    mark)."""
+
+    def point(entry) -> int | None:
+        m = _MARKING_POINT_RE.match(entry.answer_text or "")
+        return int(m.group(1)) if m else None
+
+    groups: list[list[int]] = []
+    for i, entry in enumerate(entries):
+        k = point(entry)
+        # (the row before may not open with its point: 0620/51 MJ26 2(c)'s M1 sits mid-text)
+        if groups and k is not None and k > 1:
+            groups[-1].append(i)
+        else:
+            groups.append([i])
+    if len(groups) != len(parts) or len(groups) == len(entries):
+        return None
+    for part, group in zip(parts, groups):
+        rows = [entries[i] for i in group]
+        worth = len(rows) if all(point(e) is not None for e in rows) else sum(e.marks for e in rows)
+        if part.marks > 0 and worth != part.marks:
+            return None
+    return [(part.id, i) for part, group in zip(parts, groups) for i in group]
+
+
 def join_parts_to_mark_scheme(
     questions: list[Question], mark_scheme: list["MarkSchemeEntry"]  # noqa: F821
 ) -> list[QuestionPartMarkScheme]:
@@ -143,10 +181,33 @@ def join_parts_to_mark_scheme(
                     continue
                 if part.path != entry.part_path and i > later_exact:
                     continue
+                # nor before the part's own row: "3(b)(ii)" ahead of "3(b)" is 3(a)(ii)
+                # misprinted (0625/53 ON17), left for _pair_by_position
+                # (a deeper label only: a part's heading row "1(a)" before "1(a)(i)" is fine)
+                if entry.part_path.startswith(part.path + ".") and exact_rows[k] is not None and i < exact_rows[k]:
+                    continue
+                # nor when the part, unsplit in the paper, has its own row worth all its
+                # marks: "4(e)(ii)" twice after "4(e)" is 4(f)(i), 4(f)(ii) misprinted
+                # (0580/33 MJ17), left for _pair_by_position too
+                if (
+                    entry.part_path.startswith(part.path + ".")
+                    and exact_rows[k] is not None
+                    and part.marks
+                    and entries[exact_rows[k]].marks == part.marks
+                    and not any(p.path.startswith(part.path + ".") for p in question.parts)
+                ):
+                    continue
                 if _lone_later_subpart(entry, entries):
                     continue
                 matched.setdefault(part.id, []).append(i)
                 joins.append(QuestionPartMarkScheme(part_id=part.id, mark_scheme_entry_id=entry.id))
+        # one row printed for two parts, "2(a),(b)": the second gets it too
+        for i, entry in enumerate(entries):
+            for also in entry.also_paths:
+                for part in question.parts:
+                    if _same_or_ancestor(part.path, also) and i not in matched.get(part.id, []):
+                        matched.setdefault(part.id, []).append(i)
+                        joins.append(QuestionPartMarkScheme(part_id=part.id, mark_scheme_entry_id=entry.id))
         for part_id, i in _pair_by_position(question.parts, entries, matched):
             matched.setdefault(part_id, []).append(i)
             joins.append(QuestionPartMarkScheme(part_id=part_id, mark_scheme_entry_id=entries[i].id))
@@ -184,6 +245,17 @@ def join_parts_to_mark_scheme(
             len(joined_parts) < len(question.parts) or len(used_rows) < len(entries)
         ):
             aligned = _align_by_marks(question.parts, entries)
+            if aligned is not None:
+                ids = {p.id for p in question.parts}
+                joins = [j for j in joins if j.part_id not in ids]
+                matched = {}
+                for part_id, i in aligned:
+                    matched.setdefault(part_id, []).append(i)
+                    joins.append(QuestionPartMarkScheme(part_id=part_id, mark_scheme_entry_id=entries[i].id))
+        # Rows still left over: the marking points' own numbering may group them (2026)
+        used_rows = {i for indices in matched.values() for i in indices}
+        if question.parts and len(used_rows) < len(entries):
+            aligned = _align_by_marking_points(question.parts, entries)
             if aligned is not None:
                 ids = {p.id for p in question.parts}
                 joins = [j for j in joins if j.part_id not in ids]

@@ -445,3 +445,74 @@ def test_the_newer_copyright_notice_is_cut_from_the_last_crop():
     [(_, rect)] = page_segments(doc, (0, 90, 72), None, margin=48)
     assert rect.y1 < 690
     doc.close()
+
+
+def test_the_space_to_draw_in_stays_with_its_part():
+    """0680/11 MJ16 3(a)(i): "Draw a diagram showing how energy flows between all the
+    organisms named above. [3]", then 175pt of blank space to draw in before (ii) - trimmed
+    away as empty, a composed paper left no room to draw (user-reported)."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_text((72, 360), "(a) (i) Draw a diagram showing how energy flows between the organisms. [3]")
+    page.insert_text((72, 540), "(ii) State the name of the type of diagram drawn in the space above.")
+    page.insert_text((72, 560), "........................................................ [1]")
+    (_, drawn), = page_segments(doc, (0, 350.0, 72.0), (0, 530.0, 72.0), margin=48.0)
+    assert drawn.y1 > 500  # runs on to just above (ii)
+
+    # an answer line's mark: the space after it is slack, not somewhere to draw
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_text((72, 360), "(a) Name the gas.")
+    page.insert_text((72, 380), "........................................................ [1]")
+    page.insert_text((72, 540), "(b) State one use of the gas.")
+    (_, answered), = page_segments(doc, (0, 350.0, 72.0), (0, 530.0, 72.0), margin=48.0)
+    assert answered.y1 < 400
+
+
+def test_a_map_disclaimer_naming_the_insert_is_not_an_insert_page():
+    """0680/13 MJ26: 7(f) on the last page, over "...contained in this question paper/insert
+    do not imply..." - the page was taken for an insert and 7(f) lost (user-reported)."""
+    from qbx.pages import PageType, classify_page
+
+    last = (
+        "(f) Acid rain is an atmospheric pollutant. [6]\n"
+        "The boundaries and names shown ... contained in this question paper/insert do not imply official endorsement"
+    )
+    assert classify_page(last, 20, 20) != PageType.INSERT
+    assert classify_page("CASE STUDY\n0450/21/INSERT/M/J/18", 2, 4) == PageType.INSERT
+
+
+def test_material_before_question_1_is_the_papers_source_material():
+    """0680 Paper 2 opens with a map and fact sheet about the country studied, before Q1;
+    0680/22 FM26's map scale "0" became "question 0" holding it (user-reported)."""
+    from qbx.pipeline import _source_material
+    from qbx.schema import BBox, Question
+
+    q1 = Question(id="1", paper_key="p", board="b", subject="s", question_number=1, stem_text="",
+                  stem_image_path="", total_marks=1, parts=[])
+    seen = []
+
+    def segments(begin, end):
+        seen.append((begin, end))
+        return [BBox(page=1, x0=50, y0=60, x1=545, y1=750), BBox(page=2, x0=50, y0=58, x1=545, y1=326)]
+
+    material = _source_material([q1], {"Q1": ((3, 64.0, 49.0), None)}, {1, 2, 3}, segments)
+    assert [b.page for b in material] == [1, 2]
+    assert seen[0][0][0] == 0  # begun on the page before, so headers count as furniture
+
+    # a line of instructions before Q1 is not material
+    def short(begin, end):
+        return [BBox(page=1, x0=50, y0=60, x1=545, y1=80)]
+
+    assert _source_material([q1], {"Q1": ((1, 100.0, 49.0), None)}, {1, 2}, short) == []
+
+
+def test_no_question_is_numbered_0():
+    from qbx.anchors import AnchorSpan
+    from qbx.tree import ResolvedAnchor, _drop_out_of_sequence_questions
+
+    def q(text, page):
+        return ResolvedAnchor(span=AnchorSpan(text=text, x0=50, y0=700, page=page, pattern_tiers=["question"], bbox=(50, 700, 56, 710)), tier="question")
+
+    kept = _drop_out_of_sequence_questions([q("0", 1), q("1", 3), q("2", 5)])
+    assert [a.label for a in kept] == ["1", "2"]

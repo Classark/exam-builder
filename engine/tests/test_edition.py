@@ -1,6 +1,6 @@
 """Debug and release builds (qbx/edition.py, user-asked): a debug build has Claude Code and
-the Settings screen, for testing; a release build has neither, and until Classark accounts
-exist, no Claude at all."""
+the Settings screen, for testing; a release build has neither, and reaches Claude only
+through a signed-in Classark account."""
 
 import sys
 
@@ -27,6 +27,7 @@ def backend(tmp_path, monkeypatch):
 
 def test_running_from_source_is_debug_and_the_build_file_or_env_decides_otherwise(tmp_path, monkeypatch):
     monkeypatch.setattr(edition, "EDITION_FILE", tmp_path / "edition.txt")
+    monkeypatch.setattr(llm_mod, "CONFIG_DIR", tmp_path / "config")  # not signed in
     monkeypatch.delenv("QBX_EDITION", raising=False)
     assert edition.edition() == "debug" and edition.claude_available()
     (tmp_path / "edition.txt").write_text("release\n", encoding="utf-8")
@@ -61,4 +62,19 @@ def test_a_release_build_has_no_settings_and_no_claude(backend, monkeypatch):
     # even with Claude Code switched on in a settings file left behind, nothing reaches it
     assert llm_mod.get_llm("tag") is None
     reply = client.post("/api/exam/from_request", json={"text": "10 marks on electrolysis"})
-    assert reply.status_code == 400 and "isn't available in this version" in reply.json()["detail"]
+    assert reply.status_code == 400 and "Sign in to your Classark account" in reply.json()["detail"]
+
+
+def test_a_signed_in_release_build_reaches_claude_through_classark(backend, monkeypatch):
+    from qbx import account
+    from qbx.llm_api import AnthropicLLM
+
+    monkeypatch.setenv("QBX_EDITION", "release")
+    monkeypatch.setattr(account, "signed_in", lambda: True)
+    state = TestClient(backend.app).get("/api/state").json()
+    assert state["ai"] is True
+    for job, model, think in [("tag", llm_mod.TAG_MODEL, False), ("chat", llm_mod.REQUEST_MODEL, True),
+                              ("adjust", llm_mod.REQUEST_MODEL, True)]:
+        llm = llm_mod.get_llm(job)
+        assert isinstance(llm, AnthropicLLM) and llm.classark and llm.job == job
+        assert (llm.model, llm.think) == (model, think)

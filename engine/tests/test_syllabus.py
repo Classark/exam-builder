@@ -60,6 +60,41 @@ def test_claude_reads_the_tree_then_each_sections_outcomes_from_its_own_pages():
     assert topics["3"].outcomes == ["plot graphs"]
 
 
+def test_outcomes_under_deeper_headings_go_to_the_listed_topic():
+    # 0625 numbers 1.5 Forces' content 1.5.1, 1.5.2: Claude answered by those ids and every
+    # outcome was dropped (11 of 30 topics read)
+    def respond(prompt, schema):
+        if schema is _SyllabusReply:
+            return {"topics": [{"id": "1", "name": "Motion", "pages": [2]},
+                               {"id": "1.5", "name": "Forces", "parent": "1"}]}
+        assert "1.5.1, 1.5.2 under 1.5" in prompt
+        # WCP03 lists content items beside "Know and understand", and Claude gave none
+        assert "each item is an outcome" in prompt
+        return {"topics": [{"id": "1.5.1", "outcomes": ["effects of forces"]},
+                           {"id": "1.5.2", "outcomes": ["turning effect", "effects of forces"]},
+                           {"id": "1.5", "outcomes": ["centre of gravity"]}]}
+
+    topics = {t.id: t for t in read_syllabus(FakeLLM(respond), "0625", PAGES)}
+    assert topics["1.5"].outcomes == ["effects of forces", "turning effect", "centre of gravity"]
+    assert topics["1"].outcomes == []
+
+
+def test_a_group_read_empty_from_its_pages_is_read_again_from_the_whole_syllabus():
+    # 0648: topics 7-8's pages were given wrong, and both came back empty twice
+    def respond(prompt, schema):
+        if schema is _SyllabusReply:
+            return {"topics": [{"id": "7", "name": "Convenience foods", "pages": [2]},
+                               {"id": "8", "name": "Proportions", "pages": [2]}]}
+        if "=== page 10 ===" not in prompt:
+            return {"topics": [{"id": "7", "outcomes": []}]}
+        return {"topics": [{"id": "7", "outcomes": ["food additives"]}, {"id": "8", "outcomes": ["pastries"]}]}
+
+    llm = FakeLLM(respond)
+    topics = {t.id: t for t in read_syllabus(llm, "0648", PAGES)}
+    assert topics["7"].outcomes == ["food additives"] and topics["8"].outcomes == ["pastries"]
+    assert len(llm.calls) == 3  # tree, the pages, then the whole syllabus
+
+
 def test_outcomes_survive_cleaning_and_show_only_when_asked():
     topics = clean_topics([Topic(id="4.1", name="Electrolysis", outcomes=["  ions move ", ""])])
     assert topics[0].outcomes == ["ions move"]

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { Minus, Plus } from 'lucide-react'
+import { Maximize2, Minimize2, Minus, Plus } from 'lucide-react'
 import type { BBox } from './types'
 
 // Pages are rendered at 150 DPI (main.py RENDER_DPI); regions are in PDF points (1/72 in).
@@ -7,6 +7,16 @@ const POINTS_TO_PIXELS = 150 / 72
 const ZOOMS = [0.6, 0.75, 0.9, 1, 1.25, 1.5, 2]
 
 type Edge = 'top' | 'bottom' | 'left' | 'right'
+
+/** One labelled region shown beside the selected one: another part of the question, or a
+ * mark scheme row. Clicking it calls `onBoxClick` - to select that part, or link that row. */
+export interface PaneBox {
+  id: string
+  label: string
+  tone: 'problem' | 'plain'
+  segments: BBox[]
+  title?: string
+}
 
 export interface PaneEditing {
   /** Replace the regions: after an edge drag, or a region drawn afresh. */
@@ -28,6 +38,12 @@ export function PagePane({
   aside,
   zoomKey,
   allPages,
+  boxes = [],
+  onBoxClick,
+  selectedLabel,
+  tool,
+  expanded,
+  onExpand,
 }: {
   title: string
   icon: ReactNode
@@ -40,6 +56,16 @@ export function PagePane({
   /** Show every page of the document (this many), not just the highlighted ones - for
    * finding an answer anywhere in a mark scheme. */
   allPages?: number
+  /** the other regions to show, labelled - the selected one is `segments` */
+  boxes?: PaneBox[]
+  onBoxClick?: (id: string) => void
+  /** the tag on the selected region */
+  selectedLabel?: string
+  /** a strip naming the tool in use ("Click where the second part starts - Esc to cancel") */
+  tool?: ReactNode
+  /** with `onExpand`, a button that widens this document over the other one (and back) */
+  expanded?: boolean
+  onExpand?: () => void
 }) {
   const scroller = useRef<HTMLDivElement>(null)
   const [zoom, setZoom] = useState(() => {
@@ -64,8 +90,10 @@ export function PagePane({
 
   const pages = allPages
     ? Array.from({ length: allPages }, (_, i) => i)
-    : [...new Set(segments.map((s) => s.page))].sort((a, b) => a - b)
-  const target = JSON.stringify(segments)
+    : [...new Set([...segments, ...boxes.flatMap((b) => b.segments)].map((s) => s.page))].sort((a, b) => a - b)
+  // scrolled to: the selected region, else the first one with a problem, else the first
+  const scrollBox = segments.length ? null : (boxes.find((b) => b.tone === 'problem') ?? boxes[0] ?? null)
+  const target = JSON.stringify([segments, scrollBox?.id, allPages ?? 0])
 
   // Bring the first highlight into view whenever the selection changes - as soon as it's
   // drawn, which for an already-loaded page is straight away, and otherwise on image load.
@@ -91,7 +119,7 @@ export function PagePane({
         <h2 className="text-sm font-semibold">{title}</h2>
         {pages.length > 0 && (
           <span className="text-xs text-muted">
-            {pages.length === 1 ? `page ${pages[0] + 1}` : `pages ${pages.map((p) => p + 1).join(', ')}`}
+            {pageList(pages)}
           </span>
         )}
         <div className="ml-auto flex items-center gap-0.5">
@@ -108,9 +136,21 @@ export function PagePane({
           <button className="btn-ghost px-1.5" onClick={() => step(1)} aria-label={`Zoom in to the ${title.toLowerCase()}`}>
             <Plus size={15} />
           </button>
+          {onExpand && (
+            <button
+              className="btn-ghost ml-1 px-1.5"
+              onClick={onExpand}
+              title={expanded ? 'Back to both papers (Esc)' : `Widen the ${title.toLowerCase()} (f)`}
+              aria-label={expanded ? 'Back to both papers' : `Widen the ${title.toLowerCase()}`}
+              aria-pressed={expanded}
+            >
+              {expanded ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
+            </button>
+          )}
         </div>
       </div>
       {aside}
+      {tool && <div className="border-b border-accent-border bg-accent-container px-4 py-2 text-xs font-medium text-ink">{tool}</div>}
       <div ref={scroller} className="scroll-quiet min-h-0 flex-1 overflow-auto bg-sunken p-4">
         {pages.length === 0 ? (
           <div className="flex h-full items-center justify-center p-6 text-center text-sm text-muted">{empty}</div>
@@ -122,9 +162,14 @@ export function PagePane({
                 url={pageUrl(page)}
                 page={page}
                 all={segments}
-                firstPage={pageIndex === 0}
+                // the page the selected region starts on - with every region shown, not always the first
+                firstPage={segments.length ? page === segments[0].page : pageIndex === 0}
                 editing={editing}
                 onLoaded={() => setLoads((n) => n + 1)}
+                boxes={boxes}
+                scrollBox={scrollBox}
+                onBoxClick={onBoxClick}
+                selectedLabel={selectedLabel}
               />
             ))}
           </div>
@@ -141,6 +186,10 @@ function Page({
   firstPage,
   editing,
   onLoaded,
+  boxes,
+  scrollBox,
+  onBoxClick,
+  selectedLabel,
 }: {
   url: string
   page: number
@@ -148,6 +197,10 @@ function Page({
   firstPage: boolean
   editing?: PaneEditing
   onLoaded: () => void
+  boxes: PaneBox[]
+  scrollBox: PaneBox | null
+  onBoxClick?: (id: string) => void
+  selectedLabel?: string
 }) {
   const img = useRef<HTMLImageElement>(null)
   const [natural, setNatural] = useState<{ w: number; h: number } | null>(null)
@@ -248,6 +301,30 @@ function Page({
       />
       {!natural && <div className="aspect-[1/1.414] animate-pulse bg-sunken" />}
       {natural &&
+        boxes.flatMap((box) =>
+          box.segments
+            .map((s, n) => ({ s, n }))
+            .filter(({ s }) => s.page === page)
+            .map(({ s, n }) => {
+              // clickable only while nothing is being drawn or split over the page
+              const clickable = !!onBoxClick && (!editing || editing.mode === 'adjust')
+              const first = box === scrollBox && n === box.segments.findIndex((x) => x.page === page)
+              return (
+                <div
+                  key={`${box.id}:${n}`}
+                  data-first-region={first && box.segments[0].page === page ? '' : undefined}
+                  className={`region-box is-${box.tone} absolute ${clickable ? 'pointer-events-auto cursor-pointer' : 'pointer-events-none'}`}
+                  style={pct(s) ?? undefined}
+                  title={box.title}
+                  onMouseDown={(e) => clickable && e.stopPropagation()}
+                  onClick={() => clickable && onBoxClick?.(box.id)}
+                >
+                  {n === box.segments.findIndex((x) => x.page === page) && <span className="region-tag">{box.label}</span>}
+                </div>
+              )
+            }),
+        )}
+      {natural &&
         onThisPage.map(({ s, index }, i) => (
           <div
             key={index}
@@ -255,6 +332,7 @@ function Page({
             className="region-highlight pointer-events-none absolute"
             style={pct(s) ?? undefined}
           >
+            {i === 0 && selectedLabel && <span className="region-tag is-selected">{selectedLabel}</span>}
             {editing?.mode === 'adjust' &&
               (['top', 'bottom', 'left', 'right'] as Edge[]).map((edge) => (
                 <div
@@ -280,4 +358,18 @@ function Page({
         ))}
     </div>
   )
+}
+
+/** "page 5", "pages 5, 6", "pages 1-20" - runs of three or more collapsed. */
+function pageList(pages: number[]): string {
+  if (pages.length === 1) return `page ${pages[0] + 1}`
+  const runs: string[] = []
+  for (let i = 0; i < pages.length; ) {
+    let j = i
+    while (j + 1 < pages.length && pages[j + 1] === pages[j] + 1) j++
+    if (j - i >= 2) runs.push(`${pages[i] + 1}-${pages[j] + 1}`)
+    else for (let k = i; k <= j; k++) runs.push(String(pages[k] + 1))
+    i = j + 1
+  }
+  return `pages ${runs.join(', ')}`
 }

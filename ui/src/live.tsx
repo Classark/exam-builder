@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react'
 import { api } from './api'
-import type { AccountState, FixingState, PaperSummary, ScanState, TaggingState } from './types'
+import type { AccountState, AppUpdateState, LibraryProgress, PaperSummary, ScanState, TaggingState, UpdateState } from './types'
 
 /** The app's view of the library, kept current without reloading the page.
  *
@@ -21,11 +21,18 @@ interface Live {
   /** the Classark account, and whether the first poll has answered (`ready`) */
   account: AccountState
   ready: boolean
+  /** the oldest version Classark still allows; a release build older than it stops */
+  update: UpdateState | null
+  /** a Mac copy updating itself; null on Windows (the Store updates it) and in debug */
+  appUpdate: AppUpdateState | null
   tagging: TaggingState
+  /** papers being read into the library in the background (after an update), or null */
+  library: LibraryProgress | null
+  /** the app's engine hasn't answered for a while: shown, and retried */
+  unreachable: boolean
+  /** papers with questions not yet tagged; tagging waits for the teacher to start it */
+  untaggedPapers: number
   startTagging: (subject?: string) => Promise<void>
-  fixing: FixingState
-  /** Claude reviews issues: one paper, one issue on it, or (no argument) every paper. */
-  startFixing: (body?: { paper_key?: string; issue_key?: string; everything?: boolean }) => Promise<void>
   startScan: (reprocess: boolean) => Promise<void>
   /** After this tab changed something itself: check now rather than on the next tick. */
   poke: () => void
@@ -35,6 +42,10 @@ const LiveContext = createContext<Live | null>(null)
 
 const BUSY_MS = 1000
 const IDLE_MS = 3000
+const SCAN_REFRESH_MS = 5000
+// polls in a row with no answer before the app says it can't reach its engine: one slow
+// answer is nothing, three (~10-30s) is worth saying
+const UNREACHABLE_AFTER = 3
 
 export function LiveProvider({ children }: { children: ReactNode }) {
   const [version, setVersion] = useState(-1)
@@ -42,13 +53,19 @@ export function LiveProvider({ children }: { children: ReactNode }) {
   const [loaded, setLoaded] = useState(false)
   const [scan, setScan] = useState<ScanState>({ running: false })
   const [tagging, setTagging] = useState<TaggingState>({ running: false })
-  const [fixing, setFixing] = useState<FixingState>({ running: false })
+  const [untaggedPapers, setUntaggedPapers] = useState(0)
   // unknown until the first poll: hidden, so a release build never flashes Claude's buttons
   const [ai, setAi] = useState(false)
   const [edition, setEdition] = useState<'debug' | 'release'>('release')
   const [account, setAccount] = useState<AccountState>({ status: 'signed_out' })
   const [ready, setReady] = useState(false)
+  const [update, setUpdate] = useState<UpdateState | null>(null)
+  const [appUpdate, setAppUpdate] = useState<AppUpdateState | null>(null)
+  const [library, setLibrary] = useState<LibraryProgress | null>(null)
+  const [unreachable, setUnreachable] = useState(false)
+  const failures = useRef(0)
   const versionRef = useRef(-1)
+  const fetchedAt = useRef(0)
   const scanningRef = useRef(false)
   const timer = useRef<number | undefined>(undefined)
 
@@ -57,16 +74,30 @@ export function LiveProvider({ children }: { children: ReactNode }) {
     try {
       const state = await api.getState()
       // poll fast while waiting on the browser too, so signing in shows at once
+      failures.current = 0
+      setUnreachable(false)
+      setLibrary(state.library ?? null)
       scanningRef.current =
-        state.scan.running || !!state.tagging?.running || !!state.fixing?.running || state.account?.status === 'waiting'
+        state.scan.running || !!state.tagging?.running || state.account?.status === 'waiting' || !!state.library
       setScan(state.scan)
       if (state.tagging) setTagging(state.tagging)
-      if (state.fixing) setFixing(state.fixing)
+      setUntaggedPapers(state.untagged_papers ?? 0)
       setAi(state.ai ?? true)
       setEdition(state.edition ?? 'debug')
       if (state.account) setAccount(state.account)
+      setUpdate(state.update ?? null)
+      setAppUpdate(state.app_update ?? null)
       setReady(true)
-      if (state.version !== versionRef.current) {
+      // While a scan finishes paper after paper, every list re-reading the whole bank each
+      // second kept the app busy (user-reported: unbearable while processing) - so then at
+      // most every SCAN_REFRESH_MS. The version not taken stays unseen and comes next time.
+      const now = Date.now()
+      // tagging too: each paper's tags saved moves the version
+      // and while the library is read in, which publishes every second
+      const throttled =
+        (state.scan.running || !!state.tagging?.running || !!state.library) && now - fetchedAt.current < SCAN_REFRESH_MS
+      if (state.version !== versionRef.current && !throttled) {
+        fetchedAt.current = now
         versionRef.current = state.version
         const list = await api.listPapers()
         setPapers(list)
@@ -74,11 +105,13 @@ export function LiveProvider({ children }: { children: ReactNode }) {
         setLoaded(true)
       }
     } catch {
-      // backend restarting or gone: keep what's shown and try again
+      // backend restarting, busy or gone: keep what's shown, say so if it lasts, try again
+      failures.current += 1
+      if (failures.current >= UNREACHABLE_AFTER) setUnreachable(true)
     }
     // Keeps going while the window is hidden - the browser already slows hidden timers,
     // and a minimised window must not come back showing a finished scan as running.
-    timer.current = window.setTimeout(() => void tick(), scanningRef.current ? BUSY_MS : IDLE_MS)
+    timer.current = window.setTimeout(() => void tick(), scanningRef.current || failures.current ? BUSY_MS : IDLE_MS)
   }, [])
 
   useEffect(() => {
@@ -111,20 +144,10 @@ export function LiveProvider({ children }: { children: ReactNode }) {
     [tick],
   )
 
-  const startFixing = useCallback(
-    async (body: { paper_key?: string; issue_key?: string; everything?: boolean } = {}) => {
-      const state = await api.startFixing(body)
-      scanningRef.current = state.running
-      setFixing(state)
-      void tick()
-    },
-    [tick],
-  )
-
   const poke = useCallback(() => void tick(), [tick])
 
   return (
-    <LiveContext.Provider value={{ version, papers, loaded, scan, ai, edition, account, ready, tagging, startTagging, fixing, startFixing, startScan, poke }}>
+    <LiveContext.Provider value={{ version, papers, loaded, scan, ai, edition, account, ready, update, appUpdate, tagging, library, unreachable, untaggedPapers, startTagging, startScan, poke }}>
       {children}
     </LiveContext.Provider>
   )

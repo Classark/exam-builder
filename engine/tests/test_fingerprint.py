@@ -85,3 +85,10 @@ def test_single_month_sittings_are_read():
     assert read_sitting("CHEMISTRY 0620/12 March 2021") == ("F/M", 2021)
     assert read_sitting("June 2026") == ("M/J", 2026)
     assert read_sitting("February/March 2025") == ("F/M", 2025)
+
+
+def test_a_footer_with_spaces_and_a_zero_for_the_o():
+    # 0610/31 ON22 prints "0610/31/ 0/ N/22" on every page
+    from qbx.fingerprint import parse_footer
+    f = parse_footer("2\n0610/31/ 0/ N/22 \n© UCLES 2022")
+    assert (f.subject, f.paper, f.variant, f.session, f.year) == ("0610", "3", "1", "O/N", 22)

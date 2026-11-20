@@ -112,6 +112,10 @@ class _Block:
     # mark the source printed there (the group's) is blanked first.
     marks: int | None = None
     mark_style: str = "[{}]"
+    # Its container's letter, written to the left of its own on its first line: a container
+    # with no line of its own ("(a) (i) Predict..." on one line, 0620/33 MJ26 Q4) when this
+    # isn't that first line's subpart - booklets printed (a)(iv) as a bare "(i)".
+    container_label: tuple[LabelRef, str] | None = None
 
 
 @lru_cache(maxsize=512)
@@ -277,11 +281,22 @@ def _resolve_group(
                 new_label = f"({_roman(index + 1)})"
 
             relabel = (label, new_label) if label is not None else None
+            container_label = None
+            if container is not None and index == 0 and label is not None:
+                heading = headings_by_path.get(container)
+                at = heading.label_bbox if heading is not None and not heading.segments else None
+                # not when this line is the one holding the container's marker
+                if at is not None and (at.page, round(at.y0)) != (label.page, round(label.y0)):
+                    container_label = (
+                        at.model_copy(update={"page": label.page, "y0": label.y0, "y1": label.y1, "origin_y": label.origin_y}),
+                        f"({letter})",
+                    )
             if segments:
                 own = part.marks if part.marks_printed is not None and part.marks_printed != part.marks else None
                 resolved.blocks.append(_Block(
                     segments=segments, relabel=relabel, marks=own,
                     mark_style="({})" if paper.board == "Edexcel" else "[{}]",
+                    container_label=container_label,
                 ))
             resolved.marks_total += part.marks
             resolved.has_multiple_choice |= is_multiple_choice(part, paper)
@@ -351,6 +366,44 @@ class _Layout:
         width = max(max_x1 - min_x0, 1.0)
         scale = min(CONTENT_WIDTH / width, 1.0)
         return cls(origin_x=(PAGE_WIDTH - width * scale) / 2, min_x0=min_x0, scale=scale)
+
+    @classmethod
+    def shared(cls, questions: list[list[_Block]]) -> "_Layout":
+        """One layout for a whole paper, from its typical question: the median left edge
+        (Cambridge's question numbers, x ~46) and the 90th-percentile right one. Not the most
+        extreme crop: one that strayed to the page's edge moved every question of a classified
+        booklet 40pt right and shrank them (0620/11 MJ16 Q13, among ~130 questions). A
+        question reaching further gets its own fit (`fitted`)."""
+        edges = [
+            (min(s.x0 * b.unit for b in blocks for s in b.segments),
+             max(s.x1 * b.unit for b in blocks for s in b.segments))
+            for blocks in questions
+            if any(b.segments for b in blocks)
+        ]
+        if not edges:
+            return cls(origin_x=MARGIN, min_x0=0.0, scale=1.0)
+        lefts = sorted(left for left, _ in edges)
+        rights = sorted(right for _, right in edges)
+        left = lefts[(len(lefts) - 1) // 2]
+        right = max(rights[int(0.9 * (len(rights) - 1))], left + 1.0)
+        scale = min(CONTENT_WIDTH / (right - left), 1.0)
+        return cls(origin_x=(PAGE_WIDTH - (right - left) * scale) / 2, min_x0=left, scale=scale)
+
+    def fitted(self, blocks: list[_Block]) -> "_Layout":
+        """This layout, if the question stays on the page under it (within half the margin);
+        otherwise the question's own, never larger than this one's scale."""
+        spans = [(s.x0 * b.unit, s.x1 * b.unit) for b in blocks for s in b.segments]
+        if not spans:
+            return self
+        left = self.origin_x + (min(x0 for x0, _ in spans) - self.min_x0) * self.scale
+        right = self.origin_x + (max(x1 for _, x1 in spans) - self.min_x0) * self.scale
+        if left >= MARGIN / 2 and right <= PAGE_WIDTH - MARGIN / 2:
+            return self
+        own = _Layout.for_blocks(blocks)
+        if own.scale > self.scale:
+            width = (max(x1 for _, x1 in spans) - own.min_x0) * self.scale
+            own = _Layout(origin_x=(PAGE_WIDTH - width) / 2, min_x0=own.min_x0, scale=self.scale)
+        return own
 
 
 def _block_height(block: _Block, layout: _Layout) -> float:
@@ -479,6 +532,8 @@ class _PageFlow:
                 relabels.append(block.relabel)
             if block.number is not None and index == 0:
                 relabels.append(block.number)
+            if block.container_label is not None and index == 0:
+                relabels.append(block.container_label)
             last = index == len(block.segments) - 1
             mark = block.mark_style.format(block.marks) if block.marks is not None and block.marks > 0 and last else None
             self._place_segment(source_path, segment, relabels, layout, keep_with_next, block.unit, mark)
@@ -1270,6 +1325,82 @@ def _append_full_page(doc: pymupdf.Document, source_path: str, region: BBox) -> 
         trimmed.close()
 
 
+def _insert_paths(resolved: list["_ResolvedGroup | None"], out_dir: Path) -> list[tuple | None]:
+    """What each question's paper prints apart from its questions, or None: its insert
+    (qbx/inserts.py) as ("Insert", path, None), or the material it prints before Question 1
+    (Paper.source_material, 0680 Paper 2's map and fact sheet) as ("Source material", the
+    question paper's path, its regions)."""
+    from qbx.inserts import insert_for
+
+    found: dict[str, tuple | None] = {}
+    out = []
+    for r in resolved:
+        if r is None or _is_mcq(r):
+            out.append(None)
+            continue
+        key = r.paper.paper_key
+        if key not in found:
+            path = insert_for(out_dir, key)
+            if path:
+                found[key] = ("Insert", path, None)
+            elif r.paper.source_material and r.paper.source_qp_path:
+                found[key] = ("Source material", r.paper.source_qp_path, tuple(r.paper.source_material))
+            else:
+                found[key] = None
+        out.append(found[key])
+    return out
+
+
+def _insert_labels(paths: list[str | None], numbers: list[int]) -> list[str | None]:
+    """The heading over an insert, at the question it's printed before: "Insert for
+    Questions 1-2" - and None where no insert starts. An insert starts wherever a question's
+    insert differs from the question before's, so questions from one paper share one copy,
+    and a paper's questions placed apart get it again where they pick up."""
+    labels: list[str | None] = []
+    for i, path in enumerate(paths):
+        if path is None or (i and paths[i - 1] == path):
+            labels.append(None)
+            continue
+        end = i
+        while end + 1 < len(paths) and paths[end + 1] == path:
+            end += 1
+        first, last = numbers[i], numbers[end]
+        kind = path[0] if isinstance(path, tuple) else "Insert"
+        labels.append(f"{kind} for Question {first}" if first == last else f"{kind} for Questions {first}-{last}")
+    return labels
+
+
+# Room above an insert page's content for its heading
+_INSERT_HEADING = 22.0
+
+
+def _append_insert(doc: pymupdf.Document, source: "tuple | str", label: str) -> None:
+    """An insert's pages (its case study and appendices), or a paper's own source material,
+    each copied as vector content at full size where it fits, top-aligned under the heading
+    on the first."""
+    from qbx.inserts import content_pages
+
+    if isinstance(source, str):
+        source = ("Insert", source, None)
+    _, source_path, regions = source
+    for n, region in enumerate(regions if regions is not None else content_pages(source_path)):
+        page = doc.new_page(width=PAGE_WIDTH, height=PAGE_HEIGHT)
+        top = CONTENT_TOP
+        if n == 0:
+            page.insert_text((MARGIN, CONTENT_TOP + 12), label, fontsize=13, fontname="hebo")
+            top += _INSERT_HEADING
+        clip = pymupdf.Rect(region.x0, region.y0, region.x1, region.y1)
+        scale = min(1.0, CONTENT_WIDTH / clip.width, (CONTENT_BOTTOM - top) / clip.height)
+        width, height = clip.width * scale, clip.height * scale
+        left = PAGE_WIDTH / 2 + (clip.x0 - PAGE_WIDTH / 2) * scale
+        left = min(max(left, MARGIN), PAGE_WIDTH - MARGIN - width)
+        trimmed = _trimmed_source(source_path, region.page, clip, None)
+        try:
+            page.show_pdf_page(pymupdf.Rect(left, top, left + width, top + height), trimmed, region.page, clip=clip)
+        finally:
+            trimmed.close()
+
+
 def _page_ink(page: pymupdf.Page) -> pymupdf.Rect:
     """Everything printed on the page, sideways text included - the table's title and its
     gas-volume note run up the page, which crops._content_bbox doesn't count."""
@@ -1570,19 +1701,25 @@ def compose_qp_pdf(
     # One layout for the whole paper, not one per question: every question has to start at
     # the same left margin, the way a real paper sets them. Centring each question on its
     # own width instead makes narrower ones step progressively inward down the page.
-    layout = _Layout.for_blocks([block for r in resolved if r for block in r.blocks])
+    paper_layout = _Layout.shared([r.blocks for r in resolved if r])
     numbers = _section_numbers(resolved, first_number)
     mcq_numbers = [number for number, r in zip(numbers, resolved) if _is_mcq(r)]
     if formula_sheet is not None:
         _append_full_page(doc, *formula_sheet)
     flow = _PageFlow(doc)
     edexcel = _board(resolved) == "Edexcel"
+    # each source's insert (its case study) just before the first question taken from it
+    insert_paths = _insert_paths(resolved, out_dir) if include_cover else [None] * len(resolved)
+    insert_labels = _insert_labels(insert_paths, numbers)
 
     try:
         for position, r in enumerate(resolved):
             if progress is not None:
                 progress()  # one call per question, as it starts
             quiz_number = numbers[position]
+            if insert_labels[position] is not None:
+                path, label = insert_paths[position], insert_labels[position]
+                flow.insert_pages(lambda d, path=path, label=label: _append_insert(d, path, label))
             if _starts_mcq_section(resolved, position):
                 # the multiple-choice section starts on a page of its own, straight after
                 # its answer sheet - never sharing a page with a written question
@@ -1609,6 +1746,7 @@ def compose_qp_pdf(
                 flow.place_placeholder(f"Question {quiz_number}: part {path!r} not found")
             if not r.blocks:
                 continue
+            layout = paper_layout.fitted(r.blocks)
             heights = [_block_height(block, layout) for block in r.blocks]
             for index, block in enumerate(r.blocks):
                 keep = _keep_with_next(r.blocks, heights, index)

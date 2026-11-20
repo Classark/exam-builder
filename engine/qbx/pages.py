@@ -15,7 +15,7 @@ from enum import Enum
 
 import pymupdf
 
-from qbx.anchors import HEADER_FOOTER_MARGIN
+from qbx.anchors import HEADER_FOOTER_MARGIN, page_text
 
 # A question's opening line: its number, then the question itself ("37 The half-life of...").
 # Deliberately 1-2 digits so a year in a copyright notice can't pass for a question number,
@@ -79,6 +79,9 @@ def is_periodic_table(page_text: str) -> bool:
     return len(named) >= PERIODIC_TABLE_MIN_ELEMENTS
 
 
+_INSERT_CODE_RE = re.compile(r"\d{4}\s*/\s*\d{2}\s*/\s*INSERT\b")
+
+
 def classify_page(page_text: str, page_number: int, page_count: int) -> PageType:
     """page_number is 1-indexed."""
     text = page_text.upper()
@@ -88,6 +91,12 @@ def classify_page(page_text: str, page_number: int, page_count: int) -> PageType
     # page's document-length notice.
     if "BLANK PAGE" in lines:
         return PageType.BLANK
+    # Cambridge's erratum notice bound into the download, after the cover (0625/32 FM19,
+    # user-reported): "ERRATUM NOTICE ... Question 6(a) should read: ...", with the paper's
+    # cover text and no footer code - read as the first question page, so the paper code was
+    # looked for in its footer and the paper couldn't be extracted. It carries no marks.
+    if any(line.startswith("ERRATUM") for line in lines) and not _MARK_ALLOCATION_RE.search(page_text):
+        return PageType.INSERT
     # Not question content - its atomic numbers (1, 2, 3...) are exactly the shape of
     # question-number anchors, so it must never reach anchor detection.
     if is_periodic_table(page_text):
@@ -95,9 +104,18 @@ def classify_page(page_text: str, page_number: int, page_count: int) -> PageType
     # likewise all digits and no questions: exponents, fractions, "1/2 bh"
     if is_formula_sheet(page_text):
         return PageType.FORMULA_SHEET
-    if page_number == 1 and ("CANDIDATE" in text or "INFORMATION" in text):
+    # or no candidate block at all, when answers go in a separate answer booklet: 0455/23
+    # ON18's cover has only "READ THESE INSTRUCTIONS FIRST" and "This document consists of..."
+    # - read as a question page, the paper code was looked for in its foot (user-reported)
+    if page_number == 1 and (
+        "CANDIDATE" in text or "INFORMATION" in text
+        or "READ THESE INSTRUCTIONS FIRST" in text or "THIS DOCUMENT CONSISTS OF" in text
+    ):
         return PageType.COVER
-    if "/INSERT" in text:
+    # an insert's own code, "0450/21/INSERT/M/J/18" - never the words "this question
+    # paper/insert" in a map disclaimer (0680/13 MJ26's last page, where 7(f) is: the whole
+    # page went as an insert and 7(f) was lost, user-reported)
+    if _INSERT_CODE_RE.search(text):
         return PageType.INSERT
     # Real-paper finding (0972/11): the copyright block doesn't always get a page to
     # itself - this paper runs questions 37-40 down the top of its final page and tucks the
@@ -149,7 +167,7 @@ def data_page_region(
     code, copyright line), which sit in the same header/footer bands anchors.py excludes."""
     for index in page_order:
         page = doc[index]
-        if not is_kind(page.get_text("text")):
+        if not is_kind(page_text(page)):
             continue
         top, bottom = HEADER_FOOTER_MARGIN, page.rect.height - HEADER_FOOTER_MARGIN
         width, height = page.rect.width, page.rect.height
@@ -180,6 +198,26 @@ def data_page_region(
 def classify_document(doc: object) -> list[PageType]:
     page_count = doc.page_count
     return [
-        classify_page(page.get_text("text"), page_number=i + 1, page_count=page_count)
+        classify_page(page_text(page), page_number=i + 1, page_count=page_count)
         for i, page in enumerate(doc)
     ]
+
+
+def empty_pages(doc: object) -> list[int]:
+    """Pages (0-based) on which nothing at all is drawn - no text, no line, no image.
+
+    Real-paper finding (0452/11 ON16): printed pages 17-18 held Question 6 (a) and (b) in
+    the board's copy, and are completely white in the download - the file has its full 20
+    pages, so the cover's page count can't catch it. The parser never saw Q6's number, ran
+    Q5 (g) on across the gap, and the Reviewer could only call Q6's scheme rows "orphaned".
+    A board's intentional blank page prints "BLANK PAGE", so it's never empty. Judged by
+    rendering, at a resolution too low to cost anything, and only for pages with no text.
+    """
+    out = []
+    for i, page in enumerate(doc):
+        if page.get_text("text").strip():
+            continue
+        pix = page.get_pixmap(dpi=18, colorspace=pymupdf.csGRAY)
+        if min(pix.samples, default=255) >= 250:
+            out.append(i)
+    return out

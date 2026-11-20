@@ -49,11 +49,67 @@ def _path(subject: str):
 
 
 def load_topics(subject: str) -> TopicList:
+    """The subject's topic list: on the Classark provider the server's (`_served`) when it
+    has one, otherwise this computer's own file."""
     path = _path(subject)  # a bad subject code raises, rather than reading as "no topics"
+    served = _served(subject)
+    if served is not None:
+        return served
     try:
         return TopicList.model_validate_json(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return TopicList(subject=subject)
+
+
+# -- the Classark server's lists ---------------------------------------------------------
+# On the Classark provider every teacher tags against the server's list for the subject
+# (GET /v1/classark/topics/<subject>, uploaded by an admin from these same files), used
+# exactly as served: the server's shared tag cache hits only when two teachers' prompts
+# match byte for byte. A copy is kept in config/topics/classark/ with its ETag and checked
+# at most every SERVER_CHECK_SECONDS; without the internet, the copy is used.
+
+SERVER_CHECK_SECONDS = 3600
+_checked: dict[str, float] = {}
+
+
+def _served_path(subject: str):
+    return llm_mod.CONFIG_DIR / "topics" / "classark" / f"{subject}.json"
+
+
+def _served(subject: str) -> TopicList | None:
+    import time
+
+    if llm_mod._override is not None or llm_mod.active_settings().provider != "classark":
+        return None
+    from qbx import account
+
+    if not account.signed_in():
+        return None
+    path = _served_path(subject)
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = None
+    if time.time() - _checked.get(subject, 0.0) > SERVER_CHECK_SECONDS:
+        try:
+            status, etag, body = account.get(f"/v1/classark/topics/{subject}", (saved or {}).get("etag"))
+        except account.AccountError:
+            status = None  # offline: the copy, if any
+        if status is not None:
+            _checked[subject] = time.time()
+        if status == 200 and isinstance(body, dict):
+            saved = {"etag": etag, "topics": body.get("topics") or []}
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(saved, ensure_ascii=False, indent=1), encoding="utf-8")
+        elif status == 404:  # the server has no list for this subject (any more)
+            saved = None
+            path.unlink(missing_ok=True)
+    if not saved:
+        return None
+    try:
+        return TopicList(subject=subject, topics=[Topic.model_validate(t) for t in saved["topics"]])
+    except (ValueError, KeyError, TypeError):
+        return None
 
 
 def clean_topics(topics: list[Topic]) -> list[Topic]:
@@ -113,6 +169,8 @@ _SYLLABUS_TEXT_LIMIT = 400_000
 # top-level topics whose outcomes one request reads, and requests at once
 _OUTCOME_GROUP = 2
 _OUTCOME_WORKERS = 4
+# topics a second-chance request asks about (each reads the whole syllabus)
+_RETRY_GROUP = 6
 
 _BOARD_NOTES = (
     "Syllabuses differ by board. Cambridge numbers topics '4' and subtopics '4.1', each with "
@@ -188,7 +246,13 @@ def _outcomes_prompt(subject: str, wanted: list[Topic], text: str) -> str:
         "with that tier or column's name (\"Supplement:\", \"Extended:\", \"Higher:\"); where a "
         "tier only says \"see Foundation Tier\", add nothing for it. Leave out worked examples "
         "and teacher notes unless they say what is or isn't assessed. A topic with subtopics gets "
-        "only the outcomes printed directly under it, if any. Use the ids exactly as given.\n\n"
+        "only the outcomes printed directly under it, if any. Use the ids exactly as given. "
+        "Outcomes printed under deeper numbered headings that aren't listed (1.5.1, 1.5.2 under "
+        "1.5) belong to the listed topic they fall under: give them under that topic's id. "
+        "Where the syllabus lists content items rather than outcome sentences (a numbered item "
+        "beside a \"Know and understand\" / \"Be able to\" column), each item is an outcome: give "
+        "it with what it covers and what students must be able to do (\"Harvard architecture: "
+        "memory structure, difference from von Neumann; complete a diagram of it\").\n\n"
         + _BOARD_NOTES
         + "\n\nTopics:\n"
         + listing
@@ -210,24 +274,52 @@ def read_syllabus(llm: LLM, subject: str, pages: list[str] | str) -> list[Topic]
     top = [t for t in topics if t.parent is None]
     groups = [top[i : i + _OUTCOME_GROUP] for i in range(0, len(top), _OUTCOME_GROUP)]
 
-    def read_group(group: list[Topic]) -> list[_TopicOutcomes]:
-        ids = descendants(topics, [t.id for t in group])
+    def read_group(group: list[Topic], whole: bool = False) -> list[_TopicOutcomes]:
+        ids = set(descendants(topics, [t.id for t in group])) if not whole else {t.id for t in group}
         wanted = [t for t in topics if t.id in ids]
         # a page either side: a topic can start at the foot of the page before. A topic
         # given no pages means the whole syllabus.
         numbers = []
-        if all(on_pages.get(t.id) for t in group):
+        if not whole and all(on_pages.get(t.id) for t in group):
             numbers = sorted(
                 {m for t in group for n in on_pages[t.id] for m in (n - 1, n, n + 1) if 1 <= m <= len(pages)}
             )
         return llm.json(_outcomes_prompt(subject, wanted, _with_page_numbers(pages, numbers)), _OutcomesReply).topics
 
+    def listed(topic_id: str) -> Topic | None:
+        # a syllabus numbered deeper than the tree (0625's 1.5.1 under 1.5, Business's
+        # 1.1.1): Claude may still answer by the deeper id - its outcomes go to the listed
+        # topic it falls under. Dropping them left 0625 with 11 of 30 topics read.
+        parts = topic_id.strip().rstrip(".").split(".")
+        while parts:
+            if (found := by_id.get(".".join(parts))) is not None:
+                return found
+            parts.pop()
+        return None
+
+    read: dict[str, list[str]] = {}
+
+    def take(reply: list[_TopicOutcomes]) -> None:
+        for got in reply:
+            topic = listed(got.id)
+            if topic is not None:
+                read.setdefault(topic.id, []).extend(o for o in got.outcomes if o not in read.get(topic.id, []))
+
     with ThreadPoolExecutor(max_workers=_OUTCOME_WORKERS) as pool:
         for reply in pool.map(read_group, groups):
-            for got in reply:
-                topic = by_id.get(got.id.strip())
-                if topic is not None and not topic.outcomes:
-                    topic.outcomes = got.outcomes
+            take(reply)
+        # every lowest-level topic still without outcomes is asked again, on its own, from
+        # the whole syllabus: the tree's pages can be wrong (0648's topics 7-8, printed on
+        # page 14, read empty twice), and a long group can come back half answered (9488
+        # read 19 of 23 topics once and 8 of 23 the next time, the syllabus unchanged)
+        parents = {t.parent for t in topics}
+        missing = [t for t in topics if t.id not in parents and not read.get(t.id)]
+        retry = [missing[i : i + _RETRY_GROUP] for i in range(0, len(missing), _RETRY_GROUP)]
+        for reply in pool.map(lambda g: read_group(g, whole=True), retry):
+            take(reply)
+    for topic_id, outcomes in read.items():
+        if not by_id[topic_id].outcomes:
+            by_id[topic_id].outcomes = outcomes
     return clean_topics(topics)
 
 

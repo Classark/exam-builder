@@ -11,9 +11,13 @@ import type {
   ClassifiedState,
   ExamOutcome,
   Fix,
-  FixingState,
+  FixStep,
   LiveState,
   AccountState,
+  Balance,
+  SavedFile,
+  SaveResult,
+  SavingState,
   PartTags,
   Settings,
   SubjectInfo,
@@ -33,27 +37,72 @@ import type {
 // and in development Vite forwards /api to it (vite.config.ts).
 const API_BASE = ''
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
-    ...init,
-  })
-  if (!response.ok) {
-    // the backend's own message when it gave one ("Switch on Claude in Settings…")
-    const body = await response.json().catch(() => ({}))
-    throw new Error(typeof body.detail === 'string' ? body.detail : `${init?.method ?? 'GET'} ${path} -> ${response.status}`)
+const STATE_TIMEOUT_MS = 10_000
+
+/** An error worth showing as it is: a sentence for the teacher, never "GET /api/x -> 500",
+ * "Failed to fetch" or a Python exception's name (user-asked: errors should read like a
+ * finished app's). What went wrong technically goes to the console and, from the server,
+ * to app.log. */
+export class AppError extends Error {
+  readonly status?: number
+
+  constructor(message: string, status?: number) {
+    super(message)
+    this.name = 'AppError'
+    this.status = status
   }
+}
+
+const UNREACHABLE = "Couldn't reach the app's engine. Check it's still running, then try again."
+const TOO_SLOW = 'That took too long to answer. Please try again.'
+
+/** The sentence for a response that failed: the server's own when it wrote one for people
+ * (every 4xx it raises, and its catch-all for 500s), else one by status. */
+function messageFor(status: number, detail: unknown): string {
+  if (typeof detail === 'string' && detail && !/^[A-Za-z]+Error\b|Traceback|Internal Server Error/.test(detail)) {
+    return detail
+  }
+  if (status === 404) return "That isn't there any more - it may have been deleted or moved."
+  if (status === 409) return 'Something else is using that right now. Wait a moment and try again.'
+  if (status === 413) return 'That file is too large.'
+  if (status >= 500) return 'Something went wrong on our side. Please try again.'
+  return "That didn't work. Please try again."
+}
+
+async function send(path: string, init: RequestInit): Promise<Response> {
+  let response: Response
+  try {
+    response = await fetch(`${API_BASE}${path}`, init)
+  } catch (e) {
+    console.error(`${init.method ?? 'GET'} ${path}`, e)
+    const name = e instanceof Error ? e.name : ''
+    throw new AppError(name === 'TimeoutError' || name === 'AbortError' ? TOO_SLOW : UNREACHABLE)
+  }
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}))
+    console.error(`${init.method ?? 'GET'} ${path} -> ${response.status}`, body)
+    throw new AppError(messageFor(response.status, body.detail), response.status)
+  }
+  return response
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await send(path, { headers: { 'Content-Type': 'application/json' }, ...init })
   return response.json() as Promise<T>
 }
 
 async function uploadRequest<T>(path: string, form: FormData): Promise<T> {
   // no Content-Type header here - the browser sets the multipart boundary itself
-  const response = await fetch(`${API_BASE}${path}`, { method: 'POST', body: form })
-  if (!response.ok) {
-    const body = await response.json().catch(() => ({}))
-    throw new Error(body.detail ?? `POST ${path} -> ${response.status}`)
-  }
+  const response = await send(path, { method: 'POST', body: form })
   return response.json() as Promise<T>
+}
+
+/** What to show for anything caught: an AppError's sentence, or a plain one for the rest
+ * (a bug in the UI itself - its details go to the console). */
+export function errorMessage(e: unknown): string {
+  if (e instanceof AppError) return e.message
+  console.error(e)
+  return 'Something went wrong. Please try again.'
 }
 
 export interface PreviewRequest {
@@ -77,10 +126,11 @@ export interface UploadResult {
 
 export const api = {
   listPapers: () => request<PaperSummary[]>('/api/papers'),
-  uploadPaper: (qpFile: File, msFile: File) => {
+  uploadPaper: (qpFile: File, msFile: File, insertFile?: File | null) => {
     const form = new FormData()
     form.append('qp_file', qpFile)
     form.append('ms_file', msFile)
+    if (insertFile) form.append('insert_file', insertFile)
     return uploadRequest<UploadResult>('/api/papers/upload', form)
   },
   // Opens the papers folder in Explorer / Finder, where PDFs go before a scan
@@ -89,7 +139,11 @@ export const api = {
   // again every pair whose report has issues - after the parser improves.
   scanPapers: (reprocess = false) =>
     request<ScanState>(`/api/papers/scan${reprocess ? '?reprocess=true' : ''}`, { method: 'POST' }),
-  getState: () => request<LiveState>('/api/state'),
+  // Never left hanging: a poll that doesn't answer within STATE_TIMEOUT_MS is given up
+  // and the next one tried, or one stuck request would stop the app updating for good.
+  getState: () => request<LiveState>('/api/state', { signal: AbortSignal.timeout(STATE_TIMEOUT_MS) }),
+  /** The last scan's report, kept on disk - "Last scan's results" in the scan menu. */
+  lastScan: () => request<ScanState>('/api/papers/scan/last'),
   getBank: () => request<{ version: number; papers: BankPaper[] }>('/api/bank'),
   search: (q: string) =>
     request<{ paper_key: string; question_number: number }[]>(`/api/search?q=${encodeURIComponent(q)}`),
@@ -118,7 +172,7 @@ export const api = {
   assetUrl: (paperKey: string, assetPath: string) =>
     `${API_BASE}/api/papers/${paperKey}/assets/${assetPath.replace(/^assets\//, '')}`,
   updatePart: (paperKey: string, partId: string, updates: Record<string, unknown>) =>
-    request(`/api/papers/${paperKey}/parts/${encodeURIComponent(partId)}`, {
+    request<{ fix_id: string }>(`/api/papers/${paperKey}/parts/${encodeURIComponent(partId)}`, {
       method: 'PATCH',
       body: JSON.stringify(updates),
     }),
@@ -129,18 +183,24 @@ export const api = {
       body: JSON.stringify({ segments }),
     }),
   setQuestionTotal: (paperKey: string, questionNumber: number, total: number) =>
-    request(`/api/papers/${paperKey}/questions/${questionNumber}/total`, {
+    request<{ fix_id: string }>(`/api/papers/${paperKey}/questions/${questionNumber}/total`, {
       method: 'PUT',
       body: JSON.stringify({ total }),
     }),
   mergePart: (paperKey: string, partId: string) =>
-    request(`/api/papers/${paperKey}/parts/${encodeURIComponent(partId)}/merge`, {
+    request<{ fix_id: string }>(`/api/papers/${paperKey}/parts/${encodeURIComponent(partId)}/merge`, {
       method: 'POST',
     }),
   splitPart: (paperKey: string, partId: string, at: { page: number; y: number }) =>
-    request(`/api/papers/${paperKey}/parts/${encodeURIComponent(partId)}/split`, {
+    request<{ fix_id: string }>(`/api/papers/${paperKey}/parts/${encodeURIComponent(partId)}/split`, {
       method: 'POST',
       body: JSON.stringify(at),
+    }),
+  /** Any Reviewer edit as fix steps, applied together as one fix - the id is for Undo. */
+  editPaper: (paperKey: string, steps: FixStep[]) =>
+    request<{ fix_id: string }>(`/api/papers/${paperKey}/edit`, {
+      method: 'POST',
+      body: JSON.stringify({ steps }),
     }),
 
   listQuestions: (params: { q?: string; subject?: string } = {}) => {
@@ -230,7 +290,14 @@ export const api = {
   signIn: () => request<AccountState>('/api/account/sign_in', { method: 'POST' }),
   cancelSignIn: () => request<AccountState>('/api/account/cancel', { method: 'POST' }),
   signOut: () => request<AccountState>('/api/account/sign_out', { method: 'POST' }),
-  openAccountPage: (page: 'subscription' | 'credit') =>
+  getBalance: () => request<Balance>('/api/account/balance'),
+  getTerms: () => request<{ version: string; accepted: boolean }>('/api/terms'),
+  acceptTerms: (version: string) =>
+    request<{ version: string; accepted: boolean }>('/api/terms/accept', { method: 'POST', body: JSON.stringify({ version }) }),
+  openUpdate: () => request<{ url: string }>('/api/update/open', { method: 'POST' }),
+  /** Mac: close, swap in the downloaded update, open again (engine/qbx/mac_update.py) */
+  installUpdate: () => request<{ ok: boolean }>('/api/update/install', { method: 'POST' }),
+  openAccountPage: (page: 'subscription' | 'credit' | 'terms' | 'privacy' | 'refunds' | 'licence') =>
     request<{ url: string }>(`/api/account/open/${page}`, { method: 'POST' }),
   topicsFromSyllabus: (subject: string, file: File) => {
     const form = new FormData()
@@ -240,15 +307,9 @@ export const api = {
   startTagging: (subject?: string) =>
     request<TaggingState>(`/api/tagging/start${subject ? `?subject=${subject}` : ''}`, { method: 'POST' }),
   stopTagging: () => request<TaggingState>('/api/tagging/stop', { method: 'POST' }),
-  /** Claude reviews open issues: one paper (or one issue on it), or every paper with issues. */
-  startFixing: (body: { paper_key?: string; issue_key?: string; everything?: boolean } = {}) =>
-    request<FixingState>('/api/fixing/start', { method: 'POST', body: JSON.stringify(body) }),
-  stopFixing: () => request<FixingState>('/api/fixing/stop', { method: 'POST' }),
-  /** Applies every suggestion Claude left, in every paper. */
-  acceptAllFixes: () =>
-    request<{ applied: number; didnt_fit: number; busy: string[]; notes: number }>('/api/fixes/accept_all', { method: 'POST' }),
+  /** Every edit made to a paper in the Reviewer, newest first. */
   listFixes: (paperKey: string) => request<Fix[]>(`/api/papers/${paperKey}/fixes`),
-  fixAction: (paperKey: string, fixId: string, action: 'accept' | 'reject' | 'undo') =>
+  fixAction: (paperKey: string, fixId: string, action: 'undo') =>
     request<Fix>(`/api/papers/${paperKey}/fixes/${fixId}/${action}`, { method: 'POST' }),
   savePartTags: (paperKey: string, body: { question_number: number; path: string; topic_ids: string[]; depends_on: string[] }) =>
     request<PartTags>(`/api/papers/${paperKey}/tags`, { method: 'PUT', body: JSON.stringify(body) }),
@@ -272,6 +333,21 @@ export const api = {
   classifiedExport: (body: ClassifiedRequest) =>
     request<ClassifiedState>('/api/classified/export', { method: 'POST', body: JSON.stringify(body) }),
   classifiedDownloadUrl: (id: number) => `${API_BASE}/api/classified/download/${id}`,
+
+  // -- saving into the teacher's folder (qbx/saving.py), not the browser's downloads --
+  getSaving: () => request<SavingState>('/api/saving'),
+  setSaveFolder: (folder: string) =>
+    request<SavingState>('/api/saving', { method: 'PUT', body: JSON.stringify({ folder }) }),
+  pickSaveFolder: () => request<{ folder: string | null }>('/api/saving/pick', { method: 'POST' }),
+  saveQuiz: (name: string, kind: 'qp' | 'ms', durationMinutes?: number | string | null, footerNote?: string) =>
+    request<SaveResult>(`/api/quizzes/${encodeURIComponent(name)}/save`, {
+      method: 'POST',
+      body: JSON.stringify({ kind, duration_minutes: Number(durationMinutes) || null, footer_note: footerNote?.trim() ?? '' }),
+    }),
+  saveClassified: (id: number) => request<SaveResult>(`/api/classified/save/${id}`, { method: 'POST' }),
+  savedFiles: () => request<SavedFile[]>('/api/saved'),
+  openSaved: (path: string) => request<{ ok: true }>('/api/saved/open', { method: 'POST', body: JSON.stringify({ path }) }),
+  showSaved: (path: string) => request<{ ok: true }>('/api/saved/show', { method: 'POST', body: JSON.stringify({ path }) }),
   /** Changes an exam from a typed instruction ("replace Q3 with...", "make it 30 marks"). */
   adjustQuiz: (name: string, text: string) =>
     request<AdjustOutcome>(`/api/quizzes/${encodeURIComponent(name)}/adjust`, {

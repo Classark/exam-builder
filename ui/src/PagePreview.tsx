@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { api, type PreviewRequest } from './api'
+import { api, type PreviewRequest, errorMessage } from './api'
 
 // Toggling several parts in a row shouldn't re-render the paper once per click.
 const DEBOUNCE_MS = 250
@@ -28,7 +28,7 @@ function usePreviewPages(request: PreviewRequest | null) {
           setPages(result.pages)
           setError('')
         })
-        .catch((e: unknown) => !stale && setError(e instanceof Error ? e.message : String(e)))
+        .catch((e: unknown) => !stale && setError(errorMessage(e)))
         .finally(() => !stale && setLoading(false))
     }, DEBOUNCE_MS)
     return () => {

@@ -8,6 +8,8 @@ folder. `locate` finds the file under the papers folder in use now instead.
 """
 
 import os
+import threading
+import time
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 # same default as main.PAPERS_DIR: <repo>/papers
@@ -37,4 +39,27 @@ def locate(path: str) -> str:
         candidate = root.joinpath(*tail) if tail else None
         if candidate is not None and candidate.is_file():
             return str(candidate)
-    return path
+    # moved into a subfolder of the papers folder (user-reported: every PDF moved into
+    # "papers\Chemistry IGCSE", and every composed question read "missing")
+    found = _by_name(root).get(parts[-1].lower()) if parts else None
+    return str(found) if found is not None and found.is_file() else path
+
+
+# every PDF under the papers folder by file name, re-read at most every _RESCAN seconds
+_RESCAN = 10.0
+_names: dict[str, Path] = {}
+_names_root: Path | None = None
+_names_read = 0.0
+_names_lock = threading.Lock()
+
+
+def _by_name(root: Path) -> dict[str, Path]:
+    global _names, _names_root, _names_read
+    with _names_lock:
+        if _names_root != root or time.monotonic() - _names_read > _RESCAN:
+            names: dict[str, Path] = {}
+            if root.is_dir():
+                for pdf in sorted(root.rglob("*.pdf")):
+                    names.setdefault(pdf.name.lower(), pdf)
+            _names, _names_root, _names_read = names, root, time.monotonic()
+        return _names

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Check, ChevronDown, Search } from 'lucide-react'
+import { BookOpen, Check, ChevronDown, Search, TriangleAlert } from 'lucide-react'
 import { comparePapers, paperCode, sitting } from './bankFolders'
 import type { PaperSummary } from './types'
 
@@ -19,6 +19,29 @@ export function StatusPill({ paper }: { paper: PaperSummary }) {
     <span className={`pill ${cls}`}>
       {tone === 'success' && <Check size={12} strokeWidth={2.5} />}
       {label}
+    </span>
+  )
+}
+
+/** A paper's insert (its case study booklet): "Insert" when the scan found it, "Insert
+ * missing" when the cover says there is one and it isn't in the papers folder - its
+ * questions would then print without the case study they're about. */
+export function InsertPill({ paper }: { paper: PaperSummary }) {
+  if (paper.has_insert)
+    return (
+      <span className="pill shrink-0 bg-sunken text-ink-2" title="Its case study prints before its questions in an exam">
+        <BookOpen size={12} />
+        Insert
+      </span>
+    )
+  if (!paper.needs_insert) return null
+  return (
+    <span
+      className="pill shrink-0 bg-warning-wash text-warning"
+      title="The cover says this paper comes with an insert (the case study). Copy it into the papers folder, or questions from this paper print without it."
+    >
+      <TriangleAlert size={12} />
+      Insert missing
     </span>
   )
 }
@@ -93,9 +116,12 @@ export function PaperPicker({
                 {current.subject_name && current.subject_name !== current.subject ? `${current.subject_name} ` : ''}
                 {paperCode(current)}
               </span>
-              <span className="block truncate text-xs text-muted">
-                {sitting(current)}
-                {current.paper_title ? ` · ${current.paper_title}` : ''}
+              <span className="flex min-w-0 items-center gap-2 text-xs text-muted">
+                <span className="truncate">
+                  {sitting(current)}
+                  {current.paper_title ? ` · ${current.paper_title}` : ''}
+                </span>
+                <InsertPill paper={current} />
               </span>
             </>
           ) : (
@@ -152,6 +178,7 @@ export function PaperPicker({
                     </span>
                     <span className="block truncate text-xs text-muted">{p.paper_title || p.subject_name}</span>
                   </span>
+                  <InsertPill paper={p} />
                   <StatusPill paper={p} />
                 </button>
               </li>

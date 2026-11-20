@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from pydantic import BaseModel
 
 from qbx.exam_builder import ExamResult, ExamSpec, build_preferring_new
+from qbx import difficulty
+from qbx.difficulty import LEVELS
 from qbx.exam_request import MAX_MARKS
 from qbx.llm import LLM
 from qbx.topics import Topic
@@ -42,6 +44,8 @@ class _AdjustReply(BaseModel):
     year_from: int = 0
     year_to: int = 0
     papers: list[str] = []
+    # the level new questions should be at: "easy", "medium", "hard", "very hard", or ""
+    difficulty: str = ""
     summary: str = ""
     unmatched: list[str] = []
 
@@ -61,6 +65,7 @@ class Adjustment(BaseModel):
     year_from: int | None = None
     year_to: int | None = None
     papers: list[str] = []
+    difficulty: int | None = None  # 1 Easy .. 4 Very hard, for new questions
     summary: str = ""
     unmatched: list[str] = []
 
@@ -78,6 +83,12 @@ class _Item:
     mcq: bool
     stem: str = ""
     label: str = ""
+    difficulty: dict[str, int] = field(default_factory=dict)  # part path -> 1..4
+
+    @property
+    def level(self) -> int:
+        """The item's difficulty, weighted by its parts' marks, to the nearest level."""
+        return difficulty.question_level([{"difficulty": self.difficulty.get(p, 2), "marks": self.marks.get(p, 0)} for p in self.part_paths]) or 2
 
     @property
     def total(self) -> int:
@@ -119,6 +130,7 @@ def exam_items(items: list[dict], entries: dict[str, dict]) -> list[_Item]:
             marks={p: by_path[p]["marks"] for p in item["part_paths"] if p in by_path},
             topics={p: by_path[p]["topics"] for p in item["part_paths"] if p in by_path},
             depends_on={p: by_path[p]["depends_on"] for p in item["part_paths"] if p in by_path},
+            difficulty={p: by_path[p].get("difficulty", 2) for p in item["part_paths"] if p in by_path},
             mcq=mcq,
             stem=(q or {}).get("stem", ""),
         ))
@@ -139,10 +151,13 @@ def build_prompt(instruction: str, items: list[_Item], spec: ExamSpec, topics: l
         f'"{instruction.strip()}"',
         "",
         f"The exam now ({total} marks). Written questions are Q1, Q2...; multiple-choice "
-        "questions are MCQ1, MCQ2... Each part is listed as label (marks): topics.",
+        "questions are MCQ1, MCQ2... Each question shows its difficulty (Easy, Medium, Hard, "
+        "Very hard); each part is listed as label (marks): topics.",
     ]
     for i in sorted(items, key=lambda i: (i.mcq, int(i.label.lstrip("MCQ")))):
-        lines.append(f"{i.label}: {i.total} marks, from {i.paper_key} question {i.question_number}. {i.stem}")
+        lines.append(
+            f"{i.label}: {i.total} marks, {LEVELS[i.level]}, from {i.paper_key} question {i.question_number}. {i.stem}"
+        )
         for p in i.part_paths:
             label = p or "(whole question)"
             tnames = ", ".join(names.get(t, t) for t in i.topics.get(p, [])) or "untagged"
@@ -174,6 +189,11 @@ def build_prompt(instruction: str, items: list[_Item], spec: ExamSpec, topics: l
         "- mcq_count: how many of the new questions should be multiple choice, if a number is given, else 0;",
         "- year_from / year_to / papers: limits on where new questions come from, if given "
         "('a more recent one' -> year_from a few years after the removed question's), else 0 / empty;",
+        "- difficulty: the level new questions should be at - 'easy', 'medium', 'hard' or "
+        "'very hard' - if the instruction asks for one. A relative ask is one level from the "
+        "questions it's about: 'a harder one' for a Medium question is 'hard', 'make it easier' "
+        "for an exam of Hard questions is 'medium'. To make the whole exam harder or easier, "
+        "remove every question and refill. Empty if the instruction says nothing about difficulty;",
         "- unmatched: topics asked for that nothing in the list covers, in the instruction's words;",
         "- summary: one short sentence saying what you understood, e.g. 'Replace Q3 with an "
         "electrolysis question'.",
@@ -222,6 +242,7 @@ def read_adjustment(llm: LLM, instruction: str, items: list[_Item], spec: ExamSp
         year_from=reply.year_from or None,
         year_to=reply.year_to or None,
         papers=[p.strip() for p in reply.papers if p.strip()],
+        difficulty=difficulty.parse(reply.difficulty),
         summary=" ".join(reply.summary.split())[:200],
         unmatched=[u for u in reply.unmatched if u.strip()][:10],
     )
@@ -329,6 +350,7 @@ def apply_adjustment(
             "year_from": adjustment.year_from or spec.year_from,
             "year_to": adjustment.year_to or spec.year_to,
             "papers": adjustment.papers or spec.papers,
+            "difficulty": adjustment.difficulty or spec.difficulty,
             "sources": [s.model_copy(update={"papers": adjustment.papers}) for s in spec.sources]
             if adjustment.papers else spec.sources,
         })

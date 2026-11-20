@@ -101,3 +101,15 @@ def test_a_question_paper_missing_pages_is_flagged_when_something_is_missing():
     # a download with only its blank pages stripped reconciles in full: nothing to report
     report = validate_paper(_paper(cover_page_count=16, qp_page_count=14))
     assert report.passed
+
+
+def test_empty_question_paper_pages_explain_orphaned_rows():
+    # regression (0452/11 ON16): pages 17-18 are white in the download, Q6 (a)/(b) gone with
+    # them, so Q6's scheme rows are orphaned - the report names the empty pages first
+    entry = MarkSchemeEntry(id="ms6a", paper_key="x", question_number=6, part_path="a", answer_text="", marks=6)
+    report = validate_paper(_paper(mark_scheme=[entry], qp_empty_pages=[16, 17]))
+    assert report.issues[0].check == "qp_pages_empty"
+    assert "pages 17 and 18" in report.issues[0].detail
+
+    # a paper that reconciles has lost nothing, whatever its pages look like
+    assert validate_paper(_paper(qp_empty_pages=[16])).passed

@@ -2,6 +2,7 @@ import { memo, useEffect, useMemo, useState } from 'react'
 import { ChevronRight, Folder, FolderOpen } from 'lucide-react'
 import { comparePapers, fullYear, paperCode, questionKey, sessionName, sitting } from './bankFolders'
 import { snippet } from './issues'
+import { InsertPill } from './PaperPicker'
 import type { BankPaper, BankQuestionBrief } from './types'
 
 const OPEN_STORAGE_KEY = 'qbx.questionBank.openFolders'
@@ -59,6 +60,7 @@ function FolderRow({
   depth,
   onToggle,
   children,
+  badge,
 }: {
   label: string
   detail?: string
@@ -67,6 +69,7 @@ function FolderRow({
   depth: number
   onToggle: () => void
   children: React.ReactNode
+  badge?: React.ReactNode
 }) {
   const Icon = open ? FolderOpen : Folder
   return (
@@ -81,7 +84,8 @@ function FolderRow({
         <Icon size={15} className="shrink-0 text-accent" />
         <span className="shrink-0 text-sm font-medium">{label}</span>
         {detail && <span className="truncate text-xs text-muted">{detail}</span>}
-        <span className="ml-auto shrink-0 text-xs text-faint">{count}</span>
+        {badge && <span className="ml-auto shrink-0">{badge}</span>}
+        <span className={`${badge ? '' : 'ml-auto '}shrink-0 text-xs text-faint`}>{count}</span>
       </button>
       {open && <ul>{children}</ul>}
     </li>
@@ -121,6 +125,7 @@ export const QuestionRow = memo(function QuestionRow({
             <span className="font-medium text-ink">Question {question.n}</span> · {question.marks}{' '}
             {question.marks === 1 ? 'mark' : 'marks'}
           </span>
+          {question.difficulty ? <DifficultyPill level={question.difficulty} /> : null}
           {inPaper !== undefined && <span className="pill bg-accent text-white">Q{inPaper + 1} in exam</span>}
         </div>
         <div className="mt-0.5 line-clamp-2 text-sm text-ink-2">{snippet(question.stem, question.n) || 'No text'}</div>
@@ -221,6 +226,7 @@ export function QuestionTree({
                               key={paperFolder}
                               label={`${paper.paper}${paper.variant}`}
                               detail={paper.paper_title}
+                              badge={paper.has_insert || paper.needs_insert ? <InsertPill paper={paper} /> : undefined}
                               count={paper.questions.length}
                               open={open.has(paperFolder)}
                               depth={3}
@@ -258,3 +264,11 @@ export function QuestionTree({
 
 /** "0620/41 · May/June 2024", for a search result shown outside its folder. */
 export const questionSource = (p: BankPaper) => `${paperCode(p)} · ${sitting(p)}`
+
+const LEVELS = ['', 'Easy', 'Medium', 'Hard', 'Very hard']
+const LEVEL_STYLE = ['', 'bg-success-wash text-success', 'bg-accent-wash text-ink-2', 'bg-warning-wash text-warning', 'bg-danger-wash text-danger']
+
+/** How hard a question is, 1 Easy .. 4 Very hard (qbx/difficulty.py). */
+export function DifficultyPill({ level }: { level: number }) {
+  return <span className={`pill ${LEVEL_STYLE[level] ?? ''}`}>{LEVELS[level] ?? ''}</span>
+}

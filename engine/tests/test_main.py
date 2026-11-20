@@ -539,7 +539,7 @@ def test_bank_search_and_one_question(client):
     bank = client.get("/api/bank").json()
     [paper] = bank["papers"]
     assert paper["paper_key"] == "TEST_1"
-    assert paper["questions"] == [{"n": 1, "marks": 2, "stem": "Explain X. [2]", "n_parts": 1, "topics": []}]
+    assert paper["questions"] == [{"n": 1, "difficulty": 2, "marks": 2, "stem": "Explain X. [2]", "n_parts": 1, "topics": []}]
     assert client.get("/api/search", params={"q": "explain x"}).json() == [{"paper_key": "TEST_1", "question_number": 1}]
     assert client.get("/api/search", params={"q": "nothing like it"}).json() == []
     question = client.get("/api/papers/TEST_1/questions/1").json()
@@ -663,3 +663,36 @@ def test_a_scan_that_died_does_not_block_the_next(tmp_path, monkeypatch):
 
     assert state["stage"] == "Starting"
     assert started == [False]
+
+
+def test_a_paper_deleted_with_its_pdfs_kept_is_not_scanned_back(tmp_path, monkeypatch):
+    monkeypatch.setenv("QBX_OUT_DIR", str(tmp_path / "out"))
+    monkeypatch.setenv("QBX_PAPERS_DIR", str(tmp_path / "papers"))
+    sys.modules.pop("main", None)
+    import main as backend
+
+    backend._remember_removed(str(tmp_path / "papers" / "0620_s25_qp_12.pdf"), None)
+    assert backend._removed_pdfs() == {"0620_s25_qp_12.pdf"}
+    # adding it again by hand lifts that
+    backend._forget_removed(Path("0620_S25_QP_12.pdf"))
+    assert backend._removed_pdfs() == set()
+
+
+def test_the_last_scan_s_results_can_be_opened_any_time(client):
+    """User-asked: the scan summary isn't only a popup - the last scan that extracted
+    something stays viewable, with what the folder holds now from the latest scan."""
+    import main as backend
+
+    assert client.get("/api/papers/scan/last").status_code == 404
+    with backend._scan_lock:
+        backend._scan_state.clear()
+        backend._scan_state.update(running=False, processed=[{"paper_key": "A", "passed": True}], failed=[],
+                                   unpaired=[{"file": "x.pdf", "reason": "r"}], skipped=[], finished_at=1.0)
+    backend._save_scan_report()
+    with backend._scan_lock:  # the watcher's next scan finds nothing new
+        backend._scan_state.update(processed=[], unpaired=[], skipped=["A"], finished_at=2.0)
+    backend._save_scan_report()
+
+    report = client.get("/api/papers/scan/last").json()
+    assert [p["paper_key"] for p in report["processed"]] == ["A"]
+    assert report["unpaired"] == [] and report["skipped"] == ["A"] and report["checked_at"] == 2.0

@@ -1,0 +1,139 @@
+# Builds the Mac app on GitHub's Macs: one DMG for Apple Silicon (macos-15) and one for
+# Intel (macos-15-intel), since PyInstaller builds only for the Mac it runs on.
+#
+# Run it from the Actions tab ("Mac build" > Run workflow) to get the DMGs as workflow
+# artifacts (kept 30 days), or push a v* tag to upload a release to Classark's downloads
+# bucket (Cloudflare R2: no egress charges) at exam-builder/mac/<version>/ - the DMGs, plus
+# what Mac copies update themselves from (engine/qbx/mac_update.py): each kind of Mac's
+# zipped app and its feed, mac-arm64.json / mac-x86_64.json. Uploading rolls nothing out:
+# Macs move to a version once it's chosen in the admin dashboard's App versions window
+# (config/app's examBuilderMacVersion).
+#
+# R2 secrets: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY (a token for the
+# downloads bucket only, Object Read & Write); variable R2_BUCKET (default
+# classark-downloads).
+#
+# Signed and notarised when these repository secrets are set (Settings > Secrets and
+# variables > Actions); without them the DMGs are unsigned, for testing only:
+#   MAC_CERT_P12           the Developer ID Application certificate and its key, exported
+#                          from Keychain Access as .p12, then base64 (base64 -i cert.p12 | pbcopy)
+#   MAC_CERT_PASSWORD      the password the .p12 was exported with
+#   MAC_SIGN_IDENTITY      Developer ID Application: <name> (<team id>)
+#   APPLE_ID               the Apple ID notarisation runs as
+#   APPLE_TEAM_ID          the team id in brackets in MAC_SIGN_IDENTITY
+#   APPLE_APP_PASSWORD     an app-specific password for that Apple ID (account.apple.com)
+#
+# Secrets are never given to workflows run from a fork's pull request, and this workflow
+# runs only on demand or on a tag, so nothing outside the repository can reach them.
+
+name: Mac build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install
+        run: |
+          npm ci --prefix ui --no-audit --no-fund
+          uv sync --project engine --frozen
+
+      - name: Signing keychain
+        env:
+          MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          if [ -z "$MAC_CERT_P12" ]; then
+            echo "no signing secrets: building unsigned"
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          echo "$MAC_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$MAC_CERT_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/cert.p12"
+          # let codesign use the key without a prompt
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          if [ -n "$APPLE_APP_PASSWORD" ]; then
+            xcrun notarytool store-credentials qbx --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_PASSWORD" --keychain "$keychain"
+            echo "QBX_NOTARY_PROFILE=qbx" >> "$GITHUB_ENV"
+            echo "QBX_NOTARY_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build
+        env:
+          QBX_SIGN_IDENTITY: ${{ secrets.MAC_SIGN_IDENTITY }}
+        run: uv run --project engine python package.py mac --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-${{ matrix.runner }}
+          path: |
+            dist/release/*.dmg
+            dist/release/*.zip
+            dist/release/mac-*.json
+          if-no-files-found: error
+          retention-days: 30
+
+  upload:
+    # a tag uploads both kinds of Mac's builds together, or neither
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: built
+          merge-multiple: true
+      - name: Upload to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          BUCKET: ${{ vars.R2_BUCKET || 'classark-downloads' }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          ls -l built
+          # only signed builds carry the update files, and both must be this tag's version
+          for arch in arm64 x86_64; do
+            test -f "built/mac-$arch.json"
+            grep -q "\"version\": \"$version\"" "built/mac-$arch.json"
+          done
+          prefix="s3://$BUCKET/exam-builder/mac/$version"
+          # a version once uploaded is never replaced: a Mac may already have checked it
+          if aws s3 ls "$prefix/" --endpoint-url "$ENDPOINT" | grep -q .; then
+            echo "exam-builder/mac/$version is already uploaded - bump the version"; exit 1
+          fi
+          aws s3 cp built "$prefix/" --recursive --endpoint-url "$ENDPOINT"             --cache-control "public, max-age=86400"
+          echo "Uploaded. Roll it out in the admin dashboard: App versions > Exam Builder > Mac version $version"

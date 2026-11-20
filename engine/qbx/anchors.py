@@ -41,7 +41,9 @@ QUESTION_NUMBER_RE = re.compile(r"^(\d{1,2})\.{0,2}$")
 # the 0478 QP. The closing paren is already a safe boundary regardless of what follows in
 # the same span, unlike the bare question-number pattern, which stays a strict full match
 # since relaxing that would make it match any span merely starting with 1-2 digits.
-PART_RE = re.compile(r"^\([a-z]\)")
+# A space can sit before the closing bracket - "(e )" (0610/52 MJ16 1(e)); the anchor's text
+# drops it (`_match_anchor`)
+PART_RE = re.compile(r"^\([a-z] ?\)")
 # A question number glued to its question's first words in one span. Real-paper finding
 # (0580 m25 qp 22): nine of its 23 question numbers came out as "11 A company sells...",
 # "12 (a) Write as...", so the strict full-span match above never saw them and their parts
@@ -59,8 +61,21 @@ _NUMBERED_ANSWER_LINE_RE = re.compile(r"^\d{1,2}\s*[.…]{4,}\s*$")
 _GAP_CHARS = " \t\n\r\xa0" + "".join(chr(c) for c in range(32))
 GLUED_QUESTION_NUMBER_RE = re.compile(r"^(\d{1,2})\.?[\s\x00-\x1f ]+(?=[A-Z(]|[a-z]\s*(?:=|\())")
 SUBPART_RE = re.compile(r"^\((i|ii|iii|iv|v|vi|vii|viii)\)")
+# The next question's number glued to words that open some other way - "12 300 students
+# choose...", "13 y is inversely proportional...", "19 % = {1, 2, 3...}" (the universal set
+# symbol reads "%"; 0580 2024-2026, 14 papers each lost one question). Too loose alone, so
+# only for the number straight after one already found, and never before a unit ("15 cm").
+_GLUED_NEXT_NUMBER_RE = re.compile(
+    r"^(\d{1,2})[\s\x00-\x1f\xa0]+"
+    # a unit; a one-letter one only with no word after it - "15 m is inversely..." is m
+    r"(?!(?:mm|cm|dm|km|mg|kg|ml|min|hours?|minutes?|seconds?|°)\d?\b|(?:m|g|l|s|h)\d?(?:$|[^\w\s]|\s*(?:$|[^a-z\s])))\S"
+)
+# A mark scheme set out like its question paper opens a question's answer with how it's
+# marked, run into the number: "10 1 mark for each correct storage device" (0478/12 MJ16).
+# Read against the rest of the line, since "10 1" and " mark" are spans of their own.
+_GLUED_BEFORE_MARKING_RE = re.compile(r"^(\d{1,2})[\s\x00-\x1f ]+(?=\d{1,2}\s+marks?\s+(?:for|each|per)\b)")
 
-TIERS = ["question", "part", "subpart"]
+TIERS =["question", "part", "subpart"]
 
 # The band at each page edge holding the header (page number) and footer (paper code +
 # copyright) rather than question content. Measured on every paper this has seen:
@@ -122,6 +137,38 @@ X0_TOLERANCE = 5.0
 _ALL_BOLD = 0.67
 _BOLD_TIERS = ("question", "part", "subpart")
 
+
+def _drop_numbered_lists(accepted_by_tier: dict, resolved_by_tier: dict, rejected_by_tier: dict) -> None:
+    """A plain "1", "2", "3"... stacked down a page at the question column, in a paper whose
+    question 1 is printed bold on an earlier page, is a numbered list inside a question:
+    question numbers never start again from 1.
+
+    Real-paper finding (0680/43 ON18): 2(a)(iv)'s instructions, "1. Do not spill oil." ...
+    "4. Do not ....", sit 6pt in from the question column in plain type. "3" and "4" read
+    as questions 3 and 4 - Q3 empty, 2(b) filed as 4(b). The bold rule couldn't help: the
+    paper has two questions, on two pages, under its five-page minimum."""
+    spans = accepted_by_tier["question"] + resolved_by_tier["question"]
+    first_bold_one = min((s.page for s in spans if s.bold and s.text.strip(" .") == "1"), default=None)
+    if first_bold_one is None:
+        return
+    drop: set[int] = set()
+    for page in {s.page for s in spans if s.page > first_bold_one}:
+        plain = sorted((s for s in spans if s.page == page and not s.bold), key=lambda s: s.y0)
+        for start, span in enumerate(plain):
+            if span.text.strip(" .") != "1":
+                continue
+            run = [span]
+            for nxt in plain[start + 1:]:
+                if abs(nxt.x0 - span.x0) <= X0_TOLERANCE and nxt.text.strip(" .") == str(len(run) + 1):
+                    run.append(nxt)
+            if len(run) >= 2:
+                drop.update(id(s) for s in run)
+    if not drop:
+        return
+    accepted_by_tier["question"] = [s for s in accepted_by_tier["question"] if id(s) not in drop]
+    resolved_by_tier["question"] = [s for s in resolved_by_tier["question"] if id(s) not in drop]
+    rejected_by_tier["question"].extend(s for s in spans if id(s) in drop)
+
 # Two runs printed on the same line can be reported as separate lines whose bbox tops
 # differ by a fraction of a point, when they're set in different weights or sizes. Real
 # lines are ~11pt apart, so anything closer than this belongs to the same visual row.
@@ -169,6 +216,12 @@ def decode_shifted_text(blocks: list[dict]) -> list[dict]:
     return blocks
 
 
+def page_text(page: object) -> str:
+    """`page.get_text("text")` with shifted-font lines decoded - a whole cover can be set in
+    it ("&+(0,675<" for CHEMISTRY, 0620/23 June 2026), and read raw it says nothing."""
+    return "\n".join(_unshift(line) if _is_shifted(line) else line for line in page.get_text("text").split("\n"))
+
+
 def page_blocks(page: object, kind: str = "dict") -> list[dict]:
     """`page.get_text(kind)["blocks"]` with shifted-font text decoded."""
     return decode_shifted_text(page.get_text(kind)["blocks"])
@@ -186,25 +239,61 @@ def line_top_map(page: object) -> dict[float, float]:
     shared row value makes the x-coordinate the tie-breaker it's meant to be, so the
     outer marker leads.
     """
-    tops = sorted(
-        {
-            line["bbox"][1]
-            for block in page.get_text("dict")["blocks"]
-            for line in block.get("lines", [])
-        }
-    )
+    lines = [line for block in page.get_text("dict")["blocks"] for line in block.get("lines", [])]
+    tops = sorted({line["bbox"][1] for line in lines})
     mapping: dict[float, float] = {}
     row_top = None
     for top in tops:
         if row_top is None or top - row_top > LINE_Y_TOLERANCE:
             row_top = top
         mapping[top] = row_top
-    return mapping
+    # Rows sharing a baseline are one printed row, however far apart their tops: "19" beside
+    # "(a) Find the inverse of" a matrix, whose line starts 7pt higher (0580/22 ON16) - the
+    # (a) sorted above its question and went to Q18. Whole rows are joined, never split:
+    # moving single lines left a "[2]" above its own "(iii)" (0580/41 MJ24).
+    parent = {row: row for row in mapping.values()}
+
+    def find(row: float) -> float:
+        while parent[row] != row:
+            row = parent[row]
+        return row
+
+    baselines = sorted(
+        (base, mapping[line["bbox"][1]]) for line in lines if (base := _baseline(line)) is not None
+    )
+    for (base, row), (next_base, next_row) in zip(baselines, baselines[1:]):
+        if next_base - base <= BASELINE_TOLERANCE:
+            a, b = find(row), find(next_row)
+            parent[max(a, b)] = min(a, b)
+    return {top: find(row) for top, row in mapping.items()}
+
+
+# Spans on one printed row share a baseline to within rounding
+BASELINE_TOLERANCE = 1.0
+
+
+def _baseline(line: dict) -> float | None:
+    """The baseline of a horizontal line's first printed text."""
+    if line.get("dir", (1, 0)) != (1, 0):
+        return None
+    for span in line["spans"]:
+        if span["text"].strip():
+            return span["origin"][1]
+    return None
 
 
 # What may sit between markers sharing a line: ordinary spaces, and the BEL/tab characters
 # these papers use as the gap between a marker and what follows.
-_MARKER_RUN_RE = re.compile(r"^(?:(?:\d{1,2}\.?|\([a-z]{1,4}\))[\s\x00-\x1f ]*)+$")
+# A part named in a sentence that wrapped to put it first on a line: markers then a full
+# stop or comma, "(a)(iii)." (0610/51 MJ17, "...the colour intensity score in (a)(iii).")
+# - a real label is followed by its text, never by punctuation
+# Only real markers - a letter or a numeral: "(b) (i) (red), orange, yellow..." (0625/32
+# FM16's scheme) is a part and its answer, not a sentence ending in "(red),"
+_CROSS_REFERENCE_RE = re.compile(r"^(?:\((?:[a-z]|i{1,3}|iv|vi{0,3}|ix|x)\)\s*)+[.,;:]")
+# A number needs a gap after it (or to end the run): without one, "176.0" read as the
+# markers "17", "6.", "0", and the "(g)" after "(b) 176.0" became part (g) (0625/32 FM16's
+# scheme, which lost (c) and (d) behind it). Bracketed markers may touch: "(a)(i)".
+_MARKER_RUN_RE = re.compile(r"^(?:\d{1,2}\.?(?:[\s\x00-\x1f ]+|$)|\([a-z]{1,4}\)[\s\x00-\x1f ]*)+$")
 
 
 def _only_markers(text: str) -> bool:
@@ -230,6 +319,9 @@ def _follows(earlier: str, later: str) -> bool:
         if _ROMAN_SEQUENCE.index(later) == _ROMAN_SEQUENCE.index(earlier) + 1:
             return True
     return len(earlier) == 1 and len(later) == 1 and ord(later) == ord(earlier) + 1
+
+
+_SCALE_ROW_RE = re.compile(r"^\s*(?:\d+(?:\.\d+)?\s+){2,}\d+(?:\.\d+)?\s*$")
 
 
 def _listed_markers(line_text: str) -> set[str]:
@@ -295,6 +387,10 @@ def _match_anchor(text: str) -> tuple[str, list[str]] | None:
     return (marker, tiers) if tiers else None
 
 
+def _clean_marker(marker: str) -> str:
+    return marker.replace(" ", "")
+
+
 class AnchorSpan(BaseModel):
     text: str
     x0: float
@@ -355,13 +451,38 @@ def is_horizontal_line(line: dict) -> bool:
 # foot (user-reported); 64 papers in the bank had it in their part text.
 _PAGE_FURNITURE_RE = re.compile(
     r"^(?:\*?P\d{5}[A-Z]{0,2}\d{4,}\*?|\[?turn over\s*[►▶]?|©.*|\d{4}/\d{2}/(?:[A-Z]/)+\d{2}"
-    r"|\d{2}_\d{4}_\d{2}_\d{4}_\d+(?:\.\d+)?)$",
+    r"|\d{2}_\d{4}_\d{2}_\d{4}_\d+(?:\.\d+)?"
+    # older schemes' running header, "Cambridge IGCSE – May/June 2016 0478 12" at y 51 -
+    # below the top margin, so it ran into the answer text of 0478's 2016 schemes
+    r"|cambridge\b.{0,60}?\b(?:may/june|october/november|february/march|march)\s+\d{4}(?:\s+\d{4}\s+\d{2})?)$",
     re.IGNORECASE,
 )
 
 
 def is_page_furniture_text(text: str) -> bool:
     return bool(_PAGE_FURNITURE_RE.match(text.strip()))
+
+
+# lines this close in y are one printed row
+_ROW_JITTER = 2.0
+
+
+def furniture_rows(lines) -> set[tuple]:
+    """The bboxes (as tuples) of lines on a printed row that is page furniture read across -
+    a running header set as separate lines, "Cambridge IGCSE – May/June 2016" | "0478" |
+    "12", none of which says so alone. `lines` is (text, bbox) pairs from one page."""
+    ordered = sorted(((text, tuple(bbox)) for text, bbox in lines if text.strip()), key=lambda line: line[1][1])
+    rows: list[list] = []
+    for line in ordered:
+        if rows and line[1][1] - rows[-1][-1][1][1] <= _ROW_JITTER:
+            rows[-1].append(line)
+        else:
+            rows.append([line])
+    out = set()
+    for row in rows:
+        if len(row) > 1 and is_page_furniture_text(" ".join(text.strip() for text, _ in sorted(row, key=lambda l: l[1][0]))):
+            out.update(bbox for _, bbox in row)
+    return out
 
 
 # A lone number in the middle third of the page, near its top or foot, is a page number:
@@ -440,6 +561,8 @@ def find_anchor_spans(
     the marker's span to sit at the line's own left edge, not embedded mid-line.
     """
     spans = []
+    scale_rows: set[tuple[int, float]] = set()
+    numbers_found: set[int] = set()  # question numbers anchored so far, for _GLUED_NEXT_NUMBER_RE
     width_votes: list[tuple[bool | None, bool | None]] = []  # (as Arial, as Times)
     family_votes: list[bool | None] = []
     for page_index, page in enumerate(doc):
@@ -458,6 +581,12 @@ def find_anchor_spans(
                     text = "".join(c["c"] for span in line["spans"] for c in span["chars"])
                     rows.setdefault(round(top, 1), []).append((line["bbox"][0], text))
         listed_by_row = {top: _listed_markers(" ".join(t for _, t in sorted(parts))) for top, parts in rows.items()}
+        # a printed row of nothing but numbers: a scale, an axis or a key - or a question's
+        # number with the list it asks about (0580/12 MJ22: "2" then "61 62 ... 69")
+        scale_rows |= {
+            (page_index, top) for top, parts in rows.items()
+            if _SCALE_ROW_RE.match(" ".join(t for _, t in sorted(parts)))
+        }
         # "rawdict" (not "dict") for per-character bboxes - a bold marker glued to the next
         # word into one span ("(b) The equation...", see the docstring above) means the
         # span's own bbox spans the whole line, not just the marker glyphs. quiz_export.py
@@ -480,9 +609,12 @@ def find_anchor_spans(
                 )
                 preceding = ""
                 line_text = "".join(c["c"] for span in line["spans"] for c in span["chars"]).strip()
+                if _CROSS_REFERENCE_RE.match(line_text):
+                    continue  # "(a)(iii)." - the end of a sentence wrapped onto its own line
                 line_start = len(spans)
                 listed = listed_by_row.get(round(y0, 1), set())
-                for span in _join_split_markers(line["spans"]):
+                line_spans = _join_split_markers(line["spans"])
+                for span_index, span in enumerate(line_spans):
                     raw_text = "".join(c["c"] for c in span["chars"])
                     text = raw_text.strip()
                     if not text or _invisible(span):
@@ -503,7 +635,13 @@ def find_anchor_spans(
                         rest = raw_text[pos:].strip()
                         matched = _match_anchor(rest)
                         if not matched and first and at_line_start:
-                            glued = GLUED_QUESTION_NUMBER_RE.match(rest)
+                            glued = GLUED_QUESTION_NUMBER_RE.match(rest) or _GLUED_BEFORE_MARKING_RE.match(
+                                rest + "".join(c["c"] for later in line_spans[span_index + 1:] for c in later["chars"])
+                            )
+                            if not glued:
+                                glued = _GLUED_NEXT_NUMBER_RE.match(rest)
+                                if glued and int(glued.group(1)) - 1 not in numbers_found:
+                                    glued = None
                             if glued:
                                 matched = (glued.group(1), ["question"])
                         if not matched or (not first and matched[1] == ["question"]):
@@ -514,6 +652,8 @@ def find_anchor_spans(
                             # Nov 2021 read it as question 2, a page early)
                             break
                         marker, tiers = matched
+                        if tiers == ["question"] and first and at_line_start:
+                            numbers_found.add(int(marker))
                         marker_chars = span["chars"][pos : pos + len(marker)]
                         # a span that opens with a space (" (a) Work out...", 4MA0 1F January
                         # 2018 Q17) has its bbox start 12pt left of the marker, at the
@@ -522,6 +662,8 @@ def find_anchor_spans(
                         anchor_x0 = (
                             span["bbox"][0] if first and not leading_space else marker_chars[0]["bbox"][0]
                         )
+                        if first:
+                            anchor_x0 = _padded_start(line_spans, span_index, anchor_x0)
                         follows = not first or not at_line_start
                         pos += len(marker)
                         pos += len(raw_text[pos:]) - len(raw_text[pos:].lstrip(_GAP_CHARS))
@@ -534,7 +676,7 @@ def find_anchor_spans(
                         )
                         spans.append(
                             AnchorSpan(
-                                text=marker,
+                                text=_clean_marker(marker),
                                 x0=anchor_x0,
                                 y0=y0,
                                 page=page_index,
@@ -571,7 +713,14 @@ def find_anchor_spans(
         spans,
         [times if "times" in span.font.lower() else sans for span, (sans, times) in zip(spans, width_votes)],
     )
-    return spans
+    # On a row of only numbers, a plain one is the scale's own: 0680/23 MJ18's map key
+    # "5 15 25 50" under its circles put its "5" at the question column, and it was read as
+    # Question 5 - taking 2(d)-(f) with it (user-reported). A question's number is bold
+    # (0580/12 MJ22's "2" before "61 62 ... 69" stays).
+    return [
+        s for s in spans
+        if not (s.pattern_tiers == ["question"] and not s.bold and (s.page, round(s.y0, 1)) in scale_rows)
+    ]
 
 
 # White text: on the page, but not seen. 0625/32 ON25 prints a white "i" just before
@@ -583,6 +732,22 @@ _WHITE = 0xFFFFFF
 
 def _invisible(span: dict) -> bool:
     return span.get("color") == _WHITE
+
+
+# How close white padding must sit to the marker it pads
+_PADDING_GAP = 1.5
+
+
+def _padded_start(line_spans: list[dict], index: int, x0: float) -> float:
+    """Where a marker's column starts when white text pads it: Cambridge right-aligns
+    numerals by printing invisible ones in front - "i ii" before "(i)", "ii" before "(ii)",
+    nothing before "(iii)" (0452/12 ON18 2(f)) - so the visible markers sat at x 103.5, 101.1
+    and 95, too spread to cluster, and (ii) was lost. Measured from the padding touching it."""
+    for span in reversed(line_spans[:index]):
+        if not _invisible(span) or x0 - span["bbox"][2] > _PADDING_GAP:
+            break
+        x0 = span["bbox"][0]
+    return x0
 
 
 def _ink_x0(span: dict) -> float | None:
@@ -721,6 +886,9 @@ def _cluster_unambiguous(tier_spans: list[AnchorSpan], tolerance: float) -> tupl
 # how far from its tier's column an ambiguous marker can sit and still be in it: a page set
 # off from the rest moves it up to 20pt (edexcel.MAX_PAGE_SHIFT)
 _AMBIGUOUS_REACH = 20.0
+# how far after a part letter its first subpart starts, when they share a row ("(b)(i)" is
+# 14pt; "(b) (i)" with a gap up to ~30)
+_OPENS_SUBPART = 40.0
 
 
 def resolve_tiers(spans: list[AnchorSpan], tolerance: float = X0_TOLERANCE) -> list[TierResult]:
@@ -788,6 +956,25 @@ def resolve_tiers(spans: list[AnchorSpan], tolerance: float = X0_TOLERANCE) -> l
         if span.pattern_tiers[0] in centers:
             resolved_by_tier[span.pattern_tiers[0]].append(span)
 
+    # A part letter opening "(b)(i) Complete the circuit..." is a part, wherever it starts:
+    # 0625/32 FM16 sets a space at the part column and its "(b)" 10pt on (x 81.8 against
+    # 72), so measured from its ink it fell out of the cluster, and (b)(i), (b)(ii) became a
+    # second (a)(i), (a)(ii) (found by `qbx audit`). A letter followed on its own row by a
+    # subpart numeral, near the part column and left of the subparts, is a part.
+    if "part" in centers:
+        subparts = accepted_by_tier["subpart"] + resolved_by_tier["subpart"]
+        for span in list(rejected_by_tier["part"]):
+            if abs(span.x0 - centers["part"]) > _AMBIGUOUS_REACH or (
+                "subpart" in centers and span.x0 >= centers["subpart"]
+            ):
+                continue
+            if any(
+                s.page == span.page and abs(s.y0 - span.y0) < LINE_Y_TOLERANCE and 0 < s.x0 - span.x0 < _OPENS_SUBPART
+                for s in subparts
+            ):
+                rejected_by_tier["part"].remove(span)
+                resolved_by_tier["part"].append(span)
+
     # Parts numbered (i), (ii), each with its own (a), (b) inside, set an indent further in
     # than the paper's other part letters: International A Level Further Pure ("7. (i)
     # A = ..." / "(a) Describe..." / "(ii) M = ..." / "(a) determine k", WFM01 January 2025,
@@ -837,6 +1024,8 @@ def resolve_tiers(spans: list[AnchorSpan], tolerance: float = X0_TOLERANCE) -> l
             resolved_by_tier[tier] = [s for s in resolved_by_tier[tier] if s.bold]
             rejected_by_tier[tier].extend(plain)
 
+    _drop_numbered_lists(accepted_by_tier, resolved_by_tier, rejected_by_tier)
+
     results = []
     for tier in TIERS:
         all_accepted = sorted(
@@ -862,3 +1051,75 @@ def check_tier_ordering(results: list[TierResult]) -> bool:
     """
     centers = [r.x0_center for r in results if r.x0_center is not None]
     return centers == sorted(centers)
+
+
+# How far a page's markers may be set off from the paper's columns and still be moved back
+_MAX_MARKER_SHIFT = 60.0
+
+
+def marker_page_shifts(spans: list[AnchorSpan]) -> dict[int, float]:
+    """Pages whose question number and part letter are both set the same distance right of
+    the paper's own columns. 0610/42 ON20 sets page 7's "3" at x 94.7 and its "(a)" at 117.3,
+    45pt right of every other page's 49.6 and 72.3 (the rest of the page isn't moved), so Q3
+    was never seen and its parts went to Q2. Two tiers have to agree on one offset, and the
+    page has no marker in either column already - a lone number anywhere proves nothing."""
+    from collections import Counter
+
+    def column(tier: str) -> float | None:
+        xs = Counter(round(s.x0) for s in spans if s.pattern_tiers == [tier])
+        return xs.most_common(1)[0][0] if xs else None
+
+    number_x, part_x = column("question"), column("part")
+    if number_x is None or part_x is None:
+        return {}
+    # A moved page keeps the paper's marker style. A dichotomous key's plain "1 (a) (b)" rows,
+    # 5.7pt right of 0610/31 ON22's bold columns, are not a page set off
+    in_columns = [s for s in spans if abs(s.x0 - number_x) <= 3 or abs(s.x0 - part_x) <= 3]
+    bold = sum(s.bold for s in in_columns) * 2 > len(in_columns)
+    spans = [s for s in spans if s.bold == bold or abs(s.x0 - number_x) <= 3 or abs(s.x0 - part_x) <= 3]
+    shifts: dict[int, float] = {}
+    for page in {s.page for s in spans}:
+        own = [s for s in spans if s.page == page]
+        if any(abs(s.x0 - number_x) <= 3 or abs(s.x0 - part_x) <= 3 for s in own):
+            continue
+        numbers = [s.x0 - number_x for s in own if s.pattern_tiers == ["question"] and 5 < s.x0 - number_x <= _MAX_MARKER_SHIFT]
+        parts = [s.x0 - part_x for s in own if s.pattern_tiers == ["part"] and 5 < s.x0 - part_x <= _MAX_MARKER_SHIFT]
+        match = next((n for n in numbers if any(abs(n - p) <= 1.5 for p in parts)), None)
+        if match is not None:
+            shifts[page] = match
+    return shifts
+
+
+def place_moved_numbers(spans: list[AnchorSpan]) -> None:
+    """A question number set off on its own, its parts where they belong: 0452/22 ON18 prints
+    "3" at x 72, the part letters' indent, with its text moved in to match and its (a), (b)
+    at 72 as usual - read as the wrong tier and dropped, so Q3's parts went to Q2. Moved
+    back to the question column (in place) only when it's in the paper's question-number
+    style, the page has nothing in that column, it's the very next number, and the column
+    doesn't print that number anywhere."""
+    from collections import Counter
+
+    numbers = Counter(round(s.x0) for s in spans if s.pattern_tiers == ["question"])
+    if not numbers:
+        return
+    number_x = numbers.most_common(1)[0][0]
+    in_column = [s for s in spans if s.pattern_tiers == ["question"] and abs(s.x0 - number_x) <= 3]
+    bold = sum(s.bold for s in in_column) * 2 > len(in_column)
+    pages_with_number = {s.page for s in in_column}
+    printed = {s.text for s in in_column}
+    last = 0
+    for span in sorted(spans, key=lambda s: (s.page, s.y0, s.x0)):
+        if span.pattern_tiers != ["question"] or span.follows_marker:
+            continue
+        if abs(span.x0 - number_x) <= 3:
+            last = int(span.text)
+        elif (
+            5 < span.x0 - number_x <= _MAX_MARKER_SHIFT
+            and span.bold == bold
+            and span.page not in pages_with_number
+            and int(span.text) == last + 1
+            and span.text not in printed  # a table's bold "2" when Q2 is printed later (0610/41 ON25)
+        ):
+            span.x0 = float(number_x)
+            pages_with_number.add(span.page)
+            last = int(span.text)

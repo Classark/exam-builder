@@ -13,8 +13,10 @@ from pathlib import Path
 import pymupdf
 
 from qbx.anchors import (
+    page_text,
     HEADER_FOOTER_MARGIN,
     bottom_limit,
+    furniture_rows,
     is_horizontal_line,
     is_machine_readable_mark,
     is_page_furniture_text,
@@ -122,12 +124,47 @@ def _cached(page: pymupdf.Page, what: str):
                 line for block in page.get_text("rawdict")["blocks"] for line in block.get("lines", [])
             ]
         elif what == "drawings":
-            entry[what] = page.get_drawings()
+            entry[what] = _visible_drawings(page)
         elif what == "images":
             entry[what] = page.get_image_info()
         elif what == "text":
-            entry[what] = page.get_text("text")
+            entry[what] = page_text(page)
+        elif what == "furniture":
+            entry[what] = furniture_rows(
+                ("".join(c["c"] for span in line["spans"] for c in span["chars"]), line["bbox"])
+                for line in _cached(page, "raw")
+            )
     return entry[what]
+
+
+def _visible_drawings(page: pymupdf.Page) -> list[dict]:
+    """The page's drawings, each `rect` cut to the clip it's drawn under - what can actually
+    be seen. Real-paper finding (0620/11 MJ16 Q13): the hatching in a flask's stopper is
+    drawn as long lines clipped to the stopper's square, and their unclipped box ran off the
+    page to x -21. The crop went to the page's edge, and a classified booklet - one left
+    margin for every question - pushed every question 40pt right to make room for it.
+    A drawing clipped away entirely is left out."""
+    out = []
+    clips: list[tuple[int, pymupdf.Rect]] = []  # (level, scissor), innermost last
+    for item in page.get_drawings(extended=True):
+        level = item.get("level", 0)
+        kind = item.get("type")
+        if kind in ("clip", "group"):
+            while clips and clips[-1][0] >= level:
+                clips.pop()
+            if kind == "clip" and item.get("scissor") is not None:
+                clips.append((level, pymupdf.Rect(item["scissor"])))
+            continue
+        while clips and clips[-1][0] >= level:
+            clips.pop()
+        if clips:
+            r, c = pymupdf.Rect(item["rect"]), clips[-1][1]
+            x0, y0, x1, y1 = max(r.x0, c.x0), max(r.y0, c.y0), min(r.x1, c.x1), min(r.y1, c.y1)
+            if x0 > x1 or y0 > y1:
+                continue
+            item = {**item, "rect": pymupdf.Rect(x0, y0, x1, y1)}
+        out.append(item)
+    return out
 
 
 def _line_text(line: dict) -> str:
@@ -190,6 +227,12 @@ def is_page_furniture_drawing(drawing: dict, page: pymupdf.Page) -> bool:
 # How far in from either edge a margin strip's text may sit, as a fraction of the page's
 # width: measured at x 7-15 and 574-595 on Cambridge pages; Edexcel's 0-27.
 _MARGIN_STRIP_REACH = 0.15
+# And it says so: "DO NOT WRITE IN THIS MARGIN" / "... AREA". Sideways text near an edge
+# that doesn't is content - 0452/21 MJ26's petty cash book is printed sideways, its title
+# "Reggie" / "Petty cash book" at x 49-73, and taken for the strip it clipped the page at
+# x 73 (user-reported). Over 120 sampled papers every strip line said "WRITE" (1,307 of
+# them), and none of the 700-odd other sideways lines near an edge did.
+_MARGIN_STRIP_RE = re.compile(r"\bWRITE\b", re.IGNORECASE)
 
 
 def _margin_strip_clip(page: pymupdf.Page) -> tuple[float, float]:
@@ -203,8 +246,8 @@ def _margin_strip_clip(page: pymupdf.Page) -> tuple[float, float]:
     page_width = page.rect.width
     page_height = page.rect.height
     x0, x1 = 0.0, page_width
-    for line, _, bbox in _page_lines(page):
-            if is_horizontal_line(line):
+    for line, text, bbox in _page_lines(page):
+            if is_horizontal_line(line) or not _MARGIN_STRIP_RE.search(text):
                 continue
             # The strip is set vertically at the page's edge. Text at a slant inside a figure
             # isn't it: Fig. 2.2's "CAR" in 0625/43 ON23 (x 352, at 27 degrees) clipped
@@ -224,6 +267,11 @@ def _margin_strip_clip(page: pymupdf.Page) -> tuple[float, float]:
         if r.width <= 0 or r.width > _DECORATIVE_FILL_MAX_WIDTH:
             continue
         if r.height < _DECORATIVE_FILL_MIN_HEIGHT_FRACTION * page_height:
+            continue
+        # at the page's edge, as the strip is: a bar chart's tall grey bar mid-page (x
+        # 222-239, 0610/32 ON22 Fig. 3.1) clipped Q3(a)'s crop to its right, losing the
+        # graph's axis and the "(a)" (found by `qbx audit`)
+        if r.x1 > _MARGIN_STRIP_REACH * page_width and r.x0 < (1 - _MARGIN_STRIP_REACH) * page_width:
             continue
         if r.x1 <= page_width / 2:
             x0 = max(x0, r.x1)
@@ -246,9 +294,18 @@ def _content_limit(page: pymupdf.Page) -> float:
                 limit = min(limit, bbox[1])
     if limit >= page.rect.height:
         return limit
+    # Measured from the block's own top, never from a limit already moved, and only a rule
+    # across the page: each row of a grid just above the block is within reach of the one
+    # below, and 0478/23 MJ20 7(b)'s query-by-example grid was climbed row by row, cutting
+    # the part off at its third row, its "[3]" lost (found by `qbx audit`)
+    block_top = limit
     for drawing in _cached(page, "drawings"):
         r = drawing["rect"]
-        if limit - _ACKNOWLEDGEMENTS_RULE_REACH <= r.y1 <= limit:
+        if (
+            block_top - _ACKNOWLEDGEMENTS_RULE_REACH <= r.y1 <= block_top
+            and r.height <= 2
+            and r.width >= 0.5 * page.rect.width
+        ):
             limit = min(limit, r.y0)
     return limit
 
@@ -266,13 +323,20 @@ _QUESTION_TOTAL_RE = re.compile(
     re.IGNORECASE,
 )
 _QUESTION_TOTAL_GAP = 2.0
+# A section heading - "Section B" on a line of its own, with its instructions under it ("Answer
+# any three questions.") - opens the next section, never ends the part before it. The last
+# part of a section ran on to the next question number past it (0455/21 MJ26 1(h) took Section
+# B's heading and instructions; user-reported, every paper with sections).
+_SECTION_HEADING_RE = re.compile(r"^section\s+[A-Z]\s*:?$", re.IGNORECASE)
 
 
 def _question_total_top(page: pymupdf.Page, top: float, bottom: float) -> float:
-    """The top of the first question-total line between `top` and `bottom`, or `bottom`."""
+    """The top of the first question-total line or section heading between `top` and
+    `bottom`, or `bottom`."""
     limit = bottom
     for _, text, bbox in _clipped_lines(page, pymupdf.Rect(0, top, page.rect.width, bottom)):
-            if _QUESTION_TOTAL_RE.match(text.strip()) and top < bbox[1] < limit:
+            line = text.strip()
+            if (_QUESTION_TOTAL_RE.match(line) or _SECTION_HEADING_RE.match(line)) and top < bbox[1] < limit:
                 limit = bbox[1] - _QUESTION_TOTAL_GAP
     return limit
 
@@ -310,10 +374,12 @@ def _content_bbox(
         y1 = by1 if y1 is None else max(y1, by1)
 
     for line, text, bbox in _clipped_lines(page, rect):
-            if not is_horizontal_line(line):
+            # Sideways text is ink too - a table printed sideways (0452/21 MJ26's petty
+            # cash book, its "[11]" at the far edge) - but never the margin strip
+            if not is_horizontal_line(line) and _MARGIN_STRIP_RE.search(text):
                 continue
             text = text.strip()
-            if not text or is_noise_line(text):
+            if not text or is_noise_line(text) or tuple(line["bbox"]) in _cached(page, "furniture"):
                 continue
             if header_top and bbox[1] < rect.y0 - _HEADER_GRACE:
                 continue
@@ -381,6 +447,39 @@ _OVERHANG_REACH = 80.0
 # ink stacked into one tall object - a big bracket's glyph pieces, a fraction's bar - touches
 # the piece next to it; separate lines of prose leave a gap of 2pt or more
 _STACK_TOUCH = 1.0
+# how far into the marker's line ink must reach to be across it: a fraction on the line above
+# ends 1.4pt into it ("b/a" in 0625/53 MJ23 1(b)), which took (b)'s whole line into (c)'s
+# region (found by `qbx audit`); a matrix centred on the line reaches half its height
+_CROSSES = 4.0
+
+
+# how far below its baseline a line's glyphs reach, as a share of its font size (descenders)
+_DESCENT = 0.25
+
+
+def _inked_box(line: dict) -> tuple:
+    """A text line's box down to its glyphs' foot, not its font's: "p [1]" set in a font
+    whose box runs 15pt below the baseline (0580/11 ON20 10(a)'s answer line) reached into
+    (b)'s row below, and (b)'s region took in (a)'s answer line and "[1]" (found by
+    `qbx audit`)."""
+    x0, y0, x1, y1 = line["bbox"]
+    # each character's own baseline: one text line can hold a stack of glyphs (a tall
+    # bracket's pieces), and a span's origin is only its first character's
+    feet = [
+        char["origin"][1] + _DESCENT * span["size"]
+        for span in line["spans"] if span.get("size")
+        for char in span.get("chars", [])
+        if not char["c"].isspace()
+    ]
+    return (x0, y0, x1, min(y1, max(feet))) if feet else (x0, y0, x1, y1)
+
+
+def _is_prose(text: str) -> bool:
+    """Words, not the pieces of something stacked: a matrix's entries, a fraction's
+    numerator, a bracket's glyphs are never two words. 0625/52 FM20 3(c)'s "1/I" rises
+    into the line above, and the stack grew from its numerator into all of (b)(ii)'s
+    sentence - (b)(ii)'s region came out empty (found by `qbx audit`)."""
+    return len(re.findall(r"[A-Za-z]{2,}", text)) >= 2
 
 
 def _overhang_top(page: pymupdf.Page, top: float, left: float, right: float) -> float:
@@ -391,12 +490,12 @@ def _overhang_top(page: pymupdf.Page, top: float, left: float, right: float) -> 
     that crosses the line, and what touches it going up, so the line of prose above, a gap
     away, stays with the region before."""
     items = [
-        tuple(line["bbox"])
+        _inked_box(line)
         for line in _cached(page, "raw")
-        if is_horizontal_line(line) and _line_text(line).strip()
+        if is_horizontal_line(line) and _line_text(line).strip() and not _is_prose(_line_text(line))
     ] + [tuple(d["rect"]) for d in _cached(page, "drawings") if d["rect"].height < _OVERHANG_REACH]
     items = [b for b in items if b[2] > left and b[0] < right and b[3] > top - _OVERHANG_REACH]
-    stack = [b for b in items if b[1] < top - 0.5 and b[3] > top + 1]
+    stack = [b for b in items if b[1] < top - 0.5 and b[3] > top + _CROSSES]
     reach = min((b[1] for b in stack), default=top)
     grown = True
     while grown:
@@ -410,8 +509,18 @@ def _overhang_top(page: pymupdf.Page, top: float, left: float, right: float) -> 
     return max(reach, top - _OVERHANG_REACH)
 
 
+_MARK_LINE_RE = re.compile(r"\[\d{1,2}\]\s*$")
+
+
 def _page_bottom(page: pymupdf.Page, margin: float) -> float:
-    return bottom_limit(((text, bbox) for _, text, bbox in _page_lines(page)), page.rect.height, margin)
+    limit = bottom_limit(((text, bbox) for _, text, bbox in _page_lines(page)), page.rect.height, margin)
+    # A mark printed level with the footer is the part's: 0610/52 ON16 2(a)(iv)'s "[2]" at
+    # y 788-806 beside a footer at 796, cut in half at the limit (found by `qbx audit`).
+    # Down to its glyphs' foot, at the right margin only.
+    for line, text, bbox in _page_lines(page):
+        if bbox[1] < limit < bbox[3] and bbox[2] > 0.8 * page.rect.width and _MARK_LINE_RE.search(text):
+            limit = max(limit, _inked_box(line)[3])
+    return limit
 
 
 # Cambridge's "[n]" only: Edexcel's last page can be a spare copy of a diagram ("if you need to
@@ -475,7 +584,14 @@ def page_segments(
         page_height = page.rect.height
         left, right = _margin_strip_clip(page)
         # from the top of what's printed on the marker's line, to the top of the next one's
-        top = _overhang_top(page, start_y, left, right) if page_index == start_page else top_margin(margin)
+        # never above the page's top margin: 0620/31 ON19 p.11 has two invisible drawings from
+        # y -10, off the page, crossing Q6's first line - the crop reached past the page's top
+        # edge and the whole paper failed ("CropBox not in MediaBox")
+        top = (
+            max(_overhang_top(page, start_y, left, right), min(top_margin(margin), start_y))
+            if page_index == start_page
+            else top_margin(margin)
+        )
         bottom = (
             _overhang_top(page, end_y, left, right)
             if page_index == end_page and end is not None
@@ -502,6 +618,10 @@ def page_segments(
         content = _content_bbox(page, rect, header_top=page_index != start_page)
         if content is None:
             continue
+        # only up to the next part on the same page: below a paper's last part, or above a
+        # page break, the space is the page's slack
+        if end is not None and page_index == end_page == start_page:
+            content = _with_drawing_space(page, rect, content)
         segments.append((
             page_index,
             pymupdf.Rect(
@@ -513,6 +633,38 @@ def page_segments(
         ))
 
     return segments if segments else candidates
+
+
+# A part whose answer is drawn: its instruction ends with the mark - "Draw a diagram showing
+# how energy flows between all the organisms named above. [3]" - and the blank space under
+# it, down to the next part, is where it's drawn (0680/11 MJ16 3(a)(i), user-reported: 175pt,
+# trimmed away as empty, so a composed paper left no room to draw). Kept only when the line
+# with the mark is the last ink and is wording, never an answer line ("..........[2]": the
+# space after that is the page's slack - 0478 Q1(c)(ii)'s ~100pt), and the gap is a real one.
+_DRAWING_SPACE_MIN = 40.0
+_WORDS_RE = re.compile(r"[A-Za-z]{3,}")
+
+
+def _with_drawing_space(page: pymupdf.Page, rect: pymupdf.Rect, content: pymupdf.Rect) -> pymupdf.Rect:
+    """`content`, run on to the bottom of `rect` when what's below its last line is a
+    drawing space (see _DRAWING_SPACE_MIN)."""
+    if rect.y1 - content.y1 < _DRAWING_SPACE_MIN:
+        return content
+    lines = [
+        (bbox, text.strip())
+        for line, text, bbox in _clipped_lines(page, rect)
+        if text.strip() and is_horizontal_line(line) and not is_noise_line(text.strip())
+    ]
+    if not lines:
+        return content
+    bottom = max(bbox[3] for bbox, _ in lines)
+    last = " ".join(text for bbox, text in sorted(lines, key=lambda l: l[0][0]) if bbox[3] >= bottom - 3)
+    if bottom < content.y1 - 3 or not _MARK_LINE_RE.search(last):
+        return content  # a drawing below the mark, or the last line isn't the mark's
+    wording = _MARK_LINE_RE.sub("", last)
+    if "...." in wording or "…" in wording or len(_WORDS_RE.findall(wording)) < 3:
+        return content  # an answer line's mark
+    return pymupdf.Rect(content.x0, content.y0, content.x1, rect.y1 - _TIGHT_CROP_PADDING)
 
 
 def crop_to_svg(
@@ -536,6 +688,12 @@ def crop_to_svg(
         # when it's centred on the MediaBox, but the 4CH0 June 2016 downloads' is 0.1pt off
         # centre, and the flipped box fell outside the page ("CropBox not in MediaBox").
         kind, original_cropbox = doc.xref_get_key(page.xref, "CropBox")
+        # whatever worked the region out, the crop stays on the page: one region that strays
+        # off it mustn't fail the whole paper
+        # (unrotated, as set_cropbox takes it - page.rect is the rotated page)
+        rect = rect & pymupdf.Rect(0, 0, page.mediabox.width, page.mediabox.height)
+        if rect.is_empty:
+            continue
         page.set_cropbox(rect)
         svg = page.get_svg_image()
         doc.xref_set_key(page.xref, "CropBox", original_cropbox if kind != "null" else "null")

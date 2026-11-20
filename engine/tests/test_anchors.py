@@ -284,3 +284,75 @@ def test_plain_numbers_in_a_table_are_not_bold_question_numbers():
     later = [_span(str(n), 50, y0=60, page=n + 1) for n in range(11, 14)]
     question = next(r for r in resolve_tiers(real + table + later) if r.tier == "question")
     assert [s.text for s in question.spans] == [str(n) for n in range(1, 14)]
+
+
+def test_a_page_with_its_markers_set_off_together_is_moved_back():
+    # 0610/42 ON20 p.7: "3" at 94.7 and "(a)" at 117.3, 45pt right of the paper's columns
+    from qbx.anchors import AnchorSpan, marker_page_shifts
+
+    def anchor(text, x, page, tier):
+        return AnchorSpan(text=text, x0=x, y0=60, page=page, pattern_tiers=[tier], bbox=(x, 60, x + 8, 70))
+
+    spans = [anchor("1", 49.6, 0, "question"), anchor("(a)", 72.3, 0, "part"),
+             anchor("2", 49.6, 1, "question"), anchor("(a)", 72.3, 1, "part"),
+             anchor("3", 94.7, 2, "question"), anchor("(a)", 117.3, 2, "part"),
+             anchor("4", 120.0, 3, "question")]  # a lone number off the column proves nothing
+    shifts = marker_page_shifts(spans)
+    assert abs(shifts[2] - 45) < 1 and 3 not in shifts and 0 not in shifts
+
+
+def test_a_part_named_at_the_start_of_a_wrapped_line_is_not_a_part():
+    # 0610/51 MJ17: "...colour intensity score in" / "(a)(iii)."
+    from qbx.anchors import _CROSS_REFERENCE_RE
+    assert _CROSS_REFERENCE_RE.match("(a)(iii).")
+    assert _CROSS_REFERENCE_RE.match("(b), then")
+    assert not _CROSS_REFERENCE_RE.match("(a) (iii) Record the colour")
+
+
+def test_a_plain_key_beside_the_bold_columns_is_not_a_moved_page():
+    # 0610/31 ON22: a dichotomous key's "1 (a) (b)" rows, plain, 5.7pt right of the columns
+    from qbx.anchors import AnchorSpan, marker_page_shifts
+
+    def anchor(text, x, page, tier, bold=True):
+        return AnchorSpan(text=text, x0=x, y0=60, page=page, pattern_tiers=[tier], bbox=(x, 60, x + 8, 70), bold=bold)
+
+    spans = [anchor("1", 49.6, 0, "question"), anchor("(a)", 72.3, 0, "part"),
+             anchor("2", 49.6, 3, "question"), anchor("(a)", 72.3, 3, "part"),
+             anchor("1", 55.3, 1, "question", bold=False), anchor("(a)", 78.0, 1, "part", bold=False)]
+    assert marker_page_shifts(spans) == {}
+
+
+def test_a_part_letter_with_a_space_before_its_bracket():
+    # 0610/52 MJ16 1(e) prints "(e )"
+    from qbx.anchors import PART_RE, _clean_marker
+    assert _clean_marker(PART_RE.match("(e ) Table 1.5 shows").group(0)) == "(e)"
+
+
+def test_a_plain_number_in_a_row_of_numbers_is_a_scale_not_a_question():
+    """0680/23 MJ18: a map key's "5 15 25 50" under its circles, the "5" at the question
+    column - read as Question 5, it took 2(d)-(f) (user-reported). A bold question number
+    before the list it asks about stays (0580/12 MJ22: "2" then "61 62 ... 69")."""
+    import pymupdf
+    from qbx.anchors import find_anchor_spans
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_text((50, 100), "1", fontname="hebo")
+    page.insert_text((72, 100), "The map shows bauxite mined.")
+    page.insert_text((50, 300), "5   15   25   50")
+    page.insert_text((50, 400), "2", fontname="hebo")
+    page.insert_text((119, 400), "61   62   63   64   65")
+    page.insert_text((72, 430), "From the list of numbers, write down")
+    numbers = [s.text for s in find_anchor_spans(doc) if s.pattern_tiers == ["question"]]
+    assert "5" not in numbers and "2" in numbers and "1" in numbers
+
+
+def test_a_plain_numbered_list_inside_a_question_is_not_question_numbers():
+    # regression (0680/43 ON18): 2(a)(iv)'s "1. Do not spill oil." ... "4. Do not ...." sit
+    # 6pt in from the bold question column; "3" and "4" read as questions 3 and 4
+    real = [_span("1", 50, y0=60, page=3), _span("2", 50, y0=60, page=9)]
+    items = [_span(str(n), 56, y0=337 + 26 * (n - 1), page=10) for n in range(1, 5)]
+    for s in items:
+        s.bold = False
+    question = next(r for r in resolve_tiers(real + items) if r.tier == "question")
+    assert [(s.text, s.page) for s in question.spans] == [("1", 3), ("2", 9)]

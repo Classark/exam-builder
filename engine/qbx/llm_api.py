@@ -1,7 +1,9 @@
-"""Claude through the Anthropic API (the official `anthropic` SDK), with the user's API key.
+"""Claude through the Messages API (the official `anthropic` SDK): the Classark server with
+the teacher's Classark account (`classark=True`, production), or the Anthropic API with an
+API key (development only).
 
-The production provider. Same `LLM` protocol as `ClaudeLLM` (`json(prompt, schema)`), so
-tagging, requests, chat, adjusting and fixing don't know which one they got. Every call is
+Same `LLM` protocol as `ClaudeLLM` (`json(prompt, schema)`), so
+tagging, requests, chat and adjusting don't know which one they got. Every call is
 structured output (`output_config.format` with the pydantic model's JSON schema), so a
 reply is valid JSON for the schema or an error.
 
@@ -11,7 +13,7 @@ Thinking and effort, per model (the API's rules, not Claude Code's):
   `thinking: {"type": "disabled"}` in some combination (Sonnet 5.5 and Opus 5.5 always), so
   effort is the lever: at "low" the model thinks little or not at all, which keeps output
   near the ~1,300 tokens a paper's tags need.
-- `think=True` (requests, fixing): `thinking: {"type": "adaptive"}` at the model's
+- `think=True` (requests, chat, adjusting): `thinking: {"type": "adaptive"}` at the model's
   `THINK_EFFORT` ("high" for Sonnet and Opus, Haiku's default "medium").
 Sonnet 5.5 and Opus 5.5 direct calls opt into the server-side refusal fallback
 (`fallbacks: "default"`); Haiku has none, and the Batches API rejects the parameter.
@@ -22,6 +24,14 @@ do on a subscription's limit; a rejected key, a billing problem and a refusal ar
 `LLMError`s that say what to do. Each failure's `request_id` is logged.
 
 Batches (`batch_params`, `parse_message`) are used by batch_tagging.py.
+
+The Classark server (the platform repo's EXAM_BUILDER_API.md) speaks the Messages API with
+four differences the client handles: the bearer is the account's 15-minute access token
+(renewed by account.access_token, and once more after a 401 token_expired - `call`); every
+call names its job (X-Classark-Job) and tag calls their paper for the shared cache
+(X-Classark-Cache); no beta header but the refusal fallback's - so no SDK `credentials=`
+provider, which adds the OAuth beta; and its errors carry a `classark_code` (out of credit,
+no subscription, signed out), mapped to the teacher's own words.
 """
 
 import json
@@ -32,6 +42,7 @@ from typing import Callable, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from qbx import api_key
+from qbx import llm as llm_mod
 from qbx.llm import LLMError, UsageLimitError
 
 log = logging.getLogger("qbx.llm")
@@ -52,6 +63,8 @@ MAX_TOKENS_THINK = 20_000
 # the SDK retries 408/409/429/5xx and dropped connections itself, with backoff
 SDK_RETRIES = 3
 DEFAULT_WAIT = 60.0
+# the SDK's own retries against the Classark server: its default, and the contract's advice
+CLASSARK_RETRIES = 2
 
 # tests swap this for a fake: a callable returning a client with the SDK's shape
 _client_factory: Callable[[], object] | None = None
@@ -62,20 +75,29 @@ def set_client_factory(factory: Callable[[], object] | None) -> None:
     _client_factory = factory
 
 
-def make_client():
-    """An Anthropic client for the saved (or environment) API key.
-
-    The future Classark account provider is one more branch here: the same SDK client with
-    `base_url=<the Classark server>` and `auth_token=api_key.get_secret("classark_token")`,
-    since that server speaks the Messages API and proxies it to Anthropic.
-    """
+def make_client(job: str = "tag", classark: bool = False, token: str | None = None):
+    """An SDK client: for the Classark server with an account access token, or for the
+    Anthropic API with the saved (or environment) API key."""
     if _client_factory is not None:
         return _client_factory()
+    import anthropic
+
+    if classark:
+        from qbx import account, legal
+
+        # an explicit auth_token keeps the SDK from reading ANTHROPIC_API_KEY, which the
+        # server would refuse (401 api_key_not_accepted)
+        return anthropic.Anthropic(
+            base_url=account.API_BASE,
+            auth_token=token or account.access_token(),
+            max_retries=CLASSARK_RETRIES,
+            # anthropic-version is the SDK's own (2026-10-21 from SDK 2.0), which the server
+            # allows since it was added there; it refused it before ("not supported")
+            default_headers={"X-Classark-Job": job, "X-Classark-Client": f"exam-builder/{legal.version()}"},
+        )
     key = api_key.get_api_key()
     if not key:
         raise LLMError("No Anthropic API key is saved - add one in Settings.")
-    import anthropic
-
     return anthropic.Anthropic(api_key=key, max_retries=SDK_RETRIES)
 
 
@@ -104,12 +126,64 @@ def _wait_seconds(error) -> float:
     return DEFAULT_WAIT
 
 
-def map_error(error: Exception) -> Exception:
+def classark_code(error) -> str | None:
+    body = getattr(error, "body", None)
+    if isinstance(body, dict):
+        inner = body.get("error") if isinstance(body.get("error"), dict) else body
+        code = inner.get("classark_code")
+        return code if isinstance(code, str) else None
+    return None
+
+
+def _classark_error(error, code: str | None, suffix: str) -> Exception | None:
+    """A Classark server error in the teacher's words; None for anything else (the caller
+    passes it on as it is)."""
+    import anthropic
+
+    from qbx import account
+
+    if code == "out_of_credit":
+        # pauses a tagging run, like a usage limit, rather than failing every paper
+        return UsageLimitError("You're out of Claude credit. Add credit from the account menu, "
+                               "or wait for your monthly allowance to refill." + suffix)
+    if code == "no_subscription":
+        return LLMError("Your Classark Exam Builder subscription isn't active - renew it from the account menu." + suffix)
+    if code in ("session_revoked", "token_invalid", "token_missing", "token_expired"):
+        account.forget_sign_in()
+        return LLMError("Your Classark sign-in has ended - please sign in again." + suffix)
+    if code == "account_disabled":
+        return LLMError("This Classark account is disabled." + suffix)
+    if code == "proxy_disabled":
+        return LLMError("Claude is switched off on Classark's side for now - try again later." + suffix)
+    if code in ("user_rate_limit", "user_concurrency"):
+        resets = time.time() + _wait_seconds(error)
+        return UsageLimitError(f"Too many Claude requests at once. Try again at {_when(resets)}." + suffix, resets)
+    if code == "upstream_auth":
+        return LLMError("Classark couldn't reach Claude just now - try again in a minute." + suffix)
+    if code:
+        message = getattr(error, "api_message", None) or str(error)
+        return LLMError(f"Classark refused the request ({code}): {message}" + suffix)
+    # no classark_code: Anthropic's own reply, passed on unchanged
+    if isinstance(error, anthropic.APIConnectionError):
+        return LLMError("Couldn't reach Classark - check the internet connection.")
+    if isinstance(error, (anthropic.RateLimitError, anthropic.OverloadedError)):
+        resets = time.time() + _wait_seconds(error)
+        return UsageLimitError(f"Claude is busy right now. Try again at {_when(resets)}." + suffix, resets)
+    if isinstance(error, anthropic.APIStatusError):
+        return LLMError(f"Claude failed ({error.status_code}): {error.api_message or error}" + suffix)
+    return None
+
+
+def map_error(error: Exception, classark: bool = False) -> Exception:
     """An SDK exception as the app's own error, most specific first."""
     import anthropic
 
     request_id = getattr(error, "request_id", None)
     suffix = f" (request {request_id})" if request_id else ""
+    if classark:
+        log.warning("Classark error %s %s, request_id=%s", getattr(error, "status_code", None),
+                    classark_code(error), request_id)
+        return _classark_error(error, classark_code(error), suffix) or error
     if isinstance(error, anthropic.APIStatusError):
         log.warning("Anthropic API error %s %s, request_id=%s: %s",
                     error.status_code, error.type, request_id, error.api_message or error)
@@ -174,16 +248,52 @@ class AnthropicLLM:
     RETRIES = 2  # for a reply that doesn't fit the schema; the SDK retries HTTP failures
     supports_batches = True
 
-    def __init__(self, model: str, think: bool = True, client=None):
+    def __init__(self, model: str, think: bool = True, client=None, job: str = "tag", classark: bool = False):
         self.model = model
         self.think = think
+        self.job = job
+        self.classark = classark
         self._client = client
+        self._token: str | None = None
 
     @property
     def client(self):
+        """The SDK client; on Classark, rebuilt whenever the access token was renewed."""
+        if self.classark and _client_factory is None:
+            from qbx import account
+
+            try:
+                token = account.access_token()
+            except account.AccountError as e:
+                raise LLMError(str(e)) from e
+            if self._client is None or token != self._token:
+                self._client, self._token = make_client(self.job, classark=True, token=token), token
+            return self._client
         if self._client is None:
-            self._client = make_client()
+            self._client = make_client(self.job, self.classark)
         return self._client
+
+    def call(self, request: Callable[[object], object]):
+        """`request(client)`, with SDK errors as the app's own. On Classark, a 401
+        token_expired renews the access token once and tries again."""
+        import anthropic
+
+        for attempt in (1, 2):
+            try:
+                return request(self.client)
+            except anthropic.AuthenticationError as e:
+                if self.classark and attempt == 1 and classark_code(e) == "token_expired":
+                    from qbx import account
+
+                    try:
+                        account.access_token(force=True)
+                    except account.AccountError as renewal:
+                        raise LLMError(str(renewal)) from renewal
+                    continue
+                raise map_error(e, self.classark) from e
+            except anthropic.APIError as e:
+                raise map_error(e, self.classark) from e
+        raise AssertionError("unreachable")
 
     def params(self, prompt: str, schema: type[BaseModel]) -> dict:
         """The Messages API request body, shared by direct calls and batches."""
@@ -201,21 +311,24 @@ class AnthropicLLM:
             params["thinking"] = {"type": "adaptive"}
         return params
 
+    def headers(self) -> dict:
+        """Per-call headers: the shared cache's key on Classark tag calls."""
+        label = llm_mod.current_cache_label()
+        if self.classark and self.job == "tag" and label:
+            return {"X-Classark-Cache": f"{self.job}:{label}"}
+        return {}
+
     def _create(self, params: dict):
+        extra = {"extra_headers": headers} if (headers := self.headers()) else {}
         if self.model in FALLBACK_MODELS:
-            return self.client.beta.messages.create(**params, betas=[FALLBACK_BETA], fallbacks="default")
-        return self.client.messages.create(**params)
+            return self.call(lambda c: c.beta.messages.create(**params, betas=[FALLBACK_BETA], fallbacks="default", **extra))
+        return self.call(lambda c: c.messages.create(**params, **extra))
 
     def json(self, prompt: str, schema: type[T]) -> T:
-        import anthropic
-
         params = self.params(prompt, schema)
         last: Exception | None = None
         for _ in range(self.RETRIES):
-            try:
-                message = self._create(params)
-            except anthropic.APIError as e:
-                raise map_error(e) from e
+            message = self._create(params)
             try:
                 return parse_message(message, schema)
             except (ValidationError, ValueError) as e:

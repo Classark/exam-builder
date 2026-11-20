@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { AlertTriangle, ArrowDown, ArrowUp, Download, FileStack, FileText, Loader2, Pencil, Plus, Search, Sparkles, Trash2, X } from 'lucide-react'
-import { api } from './api'
+import { AlertTriangle, ArrowDown, ArrowUp, FileStack, FileText, Loader2, Pencil, Plus, Search, Sparkles, Trash2, X } from 'lucide-react'
+import { api, errorMessage } from './api'
 import { PagePreview } from './PagePreview'
 import { Select } from './Select'
 import { paperCode, questionKey, sitting } from './bankFolders'
 import { useLive } from './live'
 import { Modal } from './Modal'
+import { SaveButton } from './Saving'
 import { snippet } from './issues'
 import { QuestionRow, QuestionTree, questionSource } from './QuestionTree'
 import { TopicChips } from './TopicChips'
@@ -16,16 +17,6 @@ const letterFor = (index: number) => LETTERS[index] ?? `z${index}`
 const SEARCH_DEBOUNCE_MS = 250
 const MAX_RESULTS_SHOWN = 300
 const FOOTER_NOTE_KEY = 'qbx.footerNote'
-
-/** Downloads a URL the way clicking a link to it would. */
-function downloadUrl(url: string) {
-  const link = document.createElement('a')
-  link.href = url
-  link.download = ''
-  document.body.appendChild(link)
-  link.click()
-  link.remove()
-}
 
 function romanFor(n: number): string {
   const numerals: [number, string][] = [
@@ -170,15 +161,34 @@ export function QuestionBank({ openExam, onAskClaude }: { openExam: string | nul
     }
   }, [version])
 
-  // The bank's folders, again whenever the library changes - a scan adds papers live.
+  // The bank's folders, again whenever the library changes - a scan adds papers live. One
+  // request at a time: it's several MB over a big library, and during a scan the library
+  // changes faster than that comes back. Stacked up, they filled the window's 6
+  // connections and the status polls queued behind them (user-reported: "the engine
+  // isn't answering"). A change meanwhile fetches once more when this one ends.
+  const bankFetch = useRef<{ busy: boolean; again: boolean }>({ busy: false, again: false })
   useEffect(() => {
-    void api
-      .getBank()
-      .then((b) => {
-        setBank(b.papers)
-        setBankLoaded(true)
-      })
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+    const state = bankFetch.current
+    if (state.busy) {
+      state.again = true
+      return
+    }
+    const load = () => {
+      state.busy = true
+      state.again = false
+      void api
+        .getBank()
+        .then((b) => {
+          setBank(b.papers)
+          setBankLoaded(true)
+        })
+        .catch((e: unknown) => setError(errorMessage(e)))
+        .finally(() => {
+          state.busy = false
+          if (state.again) load()
+        })
+    }
+    load()
   }, [version])
 
   useEffect(() => {
@@ -323,7 +333,7 @@ export function QuestionBank({ openExam, onAskClaude }: { openExam: string | nul
           ),
         )
       })
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => setError(errorMessage(e)))
   }
 
   /** With no exam chosen yet - always so on a fresh install - ticking a part starts one. */
@@ -337,7 +347,7 @@ export function QuestionBank({ openExam, onAskClaude }: { openExam: string | nul
       await api.updateQuiz(name, [{ paper_key: active.paper_key, question_number: active.question_number, part_paths: partPaths }])
       refreshQuizzes(name)
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(errorMessage(e))
     }
   }
 
@@ -416,7 +426,7 @@ export function QuestionBank({ openExam, onAskClaude }: { openExam: string | nul
       setNaming(false)
       refreshQuizzes(name)
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(errorMessage(e))
     }
   }
 
@@ -427,7 +437,7 @@ export function QuestionBank({ openExam, onAskClaude }: { openExam: string | nul
       setRenaming(false)
       refreshQuizzes(newName)
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(errorMessage(e))
     }
   }
 
@@ -463,7 +473,7 @@ export function QuestionBank({ openExam, onAskClaude }: { openExam: string | nul
       const n = Math.round(Number(value))
       api
         .setQuizDuration(name, value.trim() && Number.isFinite(n) && n > 0 ? n : null)
-        .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+        .catch((e: unknown) => setError(errorMessage(e)))
     }, 500)
   }
 
@@ -749,25 +759,22 @@ export function QuestionBank({ openExam, onAskClaude }: { openExam: string | nul
             </div>
             {quiz && (
               <>
-                <a
-                  href={canExport ? api.exportQuizQpPdfUrl(quiz.name, duration, footerNote) : undefined}
-                  onClick={() => {
-                    // the sources list comes with it: where each question was taken from
-                    if (canExport) setTimeout(() => downloadUrl(api.exportQuizSourcesPdfUrl(quiz.name, footerNote)), 400)
-                  }}
-                  aria-disabled={!canExport}
-                  title="Downloads with a sources list - where each question was taken from"
-                  className={`btn-primary whitespace-nowrap px-2.5 py-1 text-xs ${canExport ? '' : 'pointer-events-none opacity-50'}`}
+                {/* saved into the exam's own folder, with its sources list (qbx/saving.py) */}
+                <SaveButton
+                  save={() => api.saveQuiz(quiz.name, 'qp', duration, footerNote)}
+                  disabled={!canExport}
+                  title="Saves with a sources list - where each question was taken from"
+                  className="btn-primary whitespace-nowrap px-2.5 py-1 text-xs disabled:opacity-50"
                 >
-                  <Download size={13} /> Question paper
-                </a>
-                <a
-                  href={canExport ? api.exportQuizMsPdfUrl(quiz.name, footerNote) : undefined}
-                  aria-disabled={!canExport}
-                  className={`btn-secondary whitespace-nowrap px-2.5 py-1 text-xs ${canExport ? '' : 'pointer-events-none opacity-50'}`}
+                  Question paper
+                </SaveButton>
+                <SaveButton
+                  save={() => api.saveQuiz(quiz.name, 'ms', duration, footerNote)}
+                  disabled={!canExport}
+                  className="btn-secondary whitespace-nowrap px-2.5 py-1 text-xs disabled:opacity-50"
                 >
-                  <Download size={13} /> Mark scheme
-                </a>
+                  Mark scheme
+                </SaveButton>
               </>
             )}
           </div>
@@ -925,11 +932,7 @@ export function QuestionBank({ openExam, onAskClaude }: { openExam: string | nul
                 </label>
                 {canExport && (
                   <p className="text-xs text-muted">
-                    The question paper downloads with a{' '}
-                    <a className="text-accent underline" href={api.exportQuizSourcesPdfUrl(quiz.name, footerNote)}>
-                      sources list
-                    </a>{' '}
-                    - where each question was taken from.
+                    The question paper is saved with a sources list - where each question was taken from.
                   </p>
                 )}
               </div>

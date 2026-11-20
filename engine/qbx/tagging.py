@@ -31,9 +31,9 @@ import json
 import re
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
-from qbx.llm import LLM
+from qbx.llm import LLM, cache_label
 from qbx.schema import Paper, Question, QuestionPart
 from qbx.topics import Topic, topics_prompt_list
 
@@ -92,6 +92,9 @@ def question_needs_tagging(question: Question, tags: dict[str, dict]) -> bool:
         if entry is None:
             return True
         if entry.get("source") != "manual" and entry.get("text_hash") != part_hash(question, part):
+            return True
+        # tagged before Claude rated difficulty (2026-11-18): asked again, once
+        if entry.get("source") != "manual" and "difficulty" not in entry:
             return True
     return False
 
@@ -197,11 +200,20 @@ def rule_dependencies(question: Question) -> dict[str, set[str]]:
 # -- asking Claude -----------------------------------------------------------------------
 
 
+def _require_difficulty(schema: dict) -> None:
+    schema.setdefault("required", []).append("difficulty")
+
+
 class _PartTags(BaseModel):
+    # difficulty has a default so a reply without one still parses (an old batch's), but the
+    # schema sent to Claude requires it - a defaulted field is otherwise optional there
+    model_config = ConfigDict(json_schema_extra=_require_difficulty)
+
     path: str
     topic_ids: list[str]
     depends_on: list[str]
     reason: str = ""
+    difficulty: int = 0  # 1 easy .. 4 very hard (qbx/difficulty.py); 0: not given
 
 
 class _QuestionTags(BaseModel):
@@ -278,7 +290,16 @@ def build_prompt(
         "table, figure, graph, equation, method, data or experiment that is first introduced "
         "in that earlier part's text. Information in the introduction or a heading is not a "
         "dependency. If unsure, include the dependency;",
-        "- reason: a few words on why, when depends_on is not empty.",
+        "- reason: a few words on why, when depends_on is not empty;",
+        "- difficulty: how hard the part is for the full range of students taking this "
+        "qualification, from what it asks and what its mark scheme rewards - 1 Easy: recall of "
+        "a fact, a definition or reading a value, which most students get; 2 Medium: a routine "
+        "method, a standard calculation or a familiar explanation; 3 Hard: several steps, "
+        "linking ideas, an unfamiliar context or an extended answer; 4 Very hard: the hardest "
+        "on a paper, a long multi-step problem, evaluation or proof that only the strongest "
+        "students manage. Judge the part on its own, given the parts before it. Rate the "
+        "question itself, not the paper: the same question is set on Core and Extended (or "
+        "Foundation and Higher) papers and must get the same level on both.",
     ]
     return "\n".join(lines)
 
@@ -297,6 +318,11 @@ def _batches(questions: list[Question], answers: dict[str, str] | None = None) -
     return [b for b in batches if b]
 
 
+def _difficulty(reply: "_PartTags | None") -> int | None:
+    """Claude's rating if it's one of the four levels; None otherwise (the estimate stands)."""
+    return reply.difficulty if reply is not None and 1 <= reply.difficulty <= 4 else None
+
+
 def _finish(question: Question, got: _QuestionTags | None, known: set[str]) -> dict[str, dict]:
     """Claude's reply for one question, checked: only listed topics, only earlier parts,
     the rules' dependencies added, and each dependency's own dependencies with it."""
@@ -312,7 +338,7 @@ def _finish(question: Question, got: _QuestionTags | None, known: set[str]) -> d
         topic_ids = [t for t in dict.fromkeys(reply.topic_ids if reply else []) if t in known][:MAX_TOPICS_PER_PART]
         earlier = set(order[:index])
         deps[part.path] = {d for d in (reply.depends_on if reply else []) if d in earlier} | rules[part.path]
-        result[part.path] = (topic_ids, (reply.reason if reply else "")[:200])
+        result[part.path] = (topic_ids, (reply.reason if reply else "")[:200], _difficulty(reply))
     for path in order:  # closure: needing a part means needing what it needs
         stack = list(deps[path])
         while stack:
@@ -325,6 +351,7 @@ def _finish(question: Question, got: _QuestionTags | None, known: set[str]) -> d
             "topic_ids": result[part.path][0],
             "depends_on": [p for p in order if p in deps[part.path]],
             "reason": result[part.path][1] if deps[part.path] else "",
+            "difficulty": result[part.path][2],
             "text_hash": part_hash(question, part),
             "source": "claude",
         }
@@ -340,7 +367,9 @@ def tag_questions(
     whole bank (400 papers, ~7,000 questions) to ~400 requests."""
     result: dict[str, dict] = {}
     for prompt, batch in tagging_prompts(paper, questions, topics, outcomes, answers):
-        result.update(apply_reply(batch, llm.json(prompt, _PaperTags), topics))
+        with cache_label(paper.paper_key):  # the Classark server's shared cache
+            reply = llm.json(prompt, _PaperTags)
+        result.update(apply_reply(batch, reply, topics))
     return result
 
 

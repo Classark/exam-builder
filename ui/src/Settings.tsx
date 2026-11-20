@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Bot, Check, FileUp, Loader2, Pause, Play, Square, Tags } from 'lucide-react'
-import { api } from './api'
+import { Bot, FileUp, Loader2, Play, Tags } from 'lucide-react'
+import { api, errorMessage } from './api'
+import { AboutSection, AppearanceSection } from './Appearance'
+import { TaggingProgress } from './Tagging'
 import { useLive } from './live'
 import { Modal } from './Modal'
+import { SaveFolderField } from './Saving'
 import { Select } from './Select'
 import type { Settings as SettingsData, SubjectInfo, Topic } from './types'
 
@@ -39,6 +42,14 @@ export function Settings({ onClose }: { onClose: () => void }) {
   return (
     <Modal title="Settings" onClose={onClose} width="max-w-3xl">
       <div className="space-y-7">
+        <AppearanceSection />
+
+        <section className="space-y-2">
+          <h3 className="font-semibold">Save folder</h3>
+          <p className="text-sm text-ink-2">Exams, mark schemes and topic booklets are saved here, each exam in its own folder.</p>
+          <SaveFolderField />
+        </section>
+
         <ClaudeSection settings={settings} onChange={setSettings} />
 
         <section>
@@ -66,6 +77,8 @@ export function Settings({ onClose }: { onClose: () => void }) {
 
           {(tagging.running || tagging.finished_at) && <TaggingProgress />}
         </section>
+
+        <AboutSection />
       </div>
 
       {editing && (
@@ -99,7 +112,7 @@ function ClaudeSection({ settings, onChange }: { settings: SettingsData | null; 
       const result = await api.checkClaude()
       setStatus({ ok: true, text: `Connected - Claude answered in ${result.seconds} s.` })
     } catch (e) {
-      setStatus({ ok: false, text: (e as Error).message })
+      setStatus({ ok: false, text: errorMessage(e) })
     } finally {
       setBusy(false)
     }
@@ -123,13 +136,37 @@ function ClaudeSection({ settings, onChange }: { settings: SettingsData | null; 
         <div className="mt-3 space-y-3 rounded-2xl border border-line px-4 py-3">
           {/* No API keys in the app (user-decided): Claude Code here for testing; teachers will sign in
               with their Classark account, whose server reaches Claude by identity federation. */}
-          <p className="text-sm">
-            <span className="font-medium">Claude Code on this computer</span>
-            <span className="block text-xs text-muted">
-              Runs through the Claude Code install here, on the Claude subscription it’s logged in with, and counts
-              against that plan’s usage limits.
-            </span>
-          </p>
+          <fieldset className="space-y-2 text-sm">
+            {[
+              {
+                value: 'claude_code',
+                name: 'Claude Code on this computer',
+                text: 'Runs through the Claude Code install here, on the Claude subscription it’s logged in with, and counts against that plan’s usage limits.',
+              },
+              {
+                value: 'classark',
+                name: 'Classark account',
+                text: 'What teachers use: through the Classark server, on the signed-in account’s credit (sign in from the account button in the top bar). Topic lists come from the server.',
+              },
+            ].map((p) => (
+              <label key={p.value} className="flex cursor-pointer items-start gap-2">
+                <input
+                  type="radio"
+                  name="provider"
+                  className="mt-1"
+                  checked={settings.provider === p.value || (p.value === 'claude_code' && onApi)}
+                  onChange={() => {
+                    setStatus(null)
+                    void save({ provider: p.value as SettingsData['provider'] })
+                  }}
+                />
+                <span>
+                  <span className="font-medium">{p.name}</span>
+                  <span className="block text-xs text-muted">{p.text}</span>
+                </span>
+              </label>
+            ))}
+          </fieldset>
 
           <div className="flex items-center gap-2">
             <button className="btn-secondary px-3 py-1.5 text-xs" disabled={busy} onClick={() => void check()}>
@@ -172,62 +209,12 @@ function ClaudeSection({ settings, onChange }: { settings: SettingsData | null; 
               onChange={(v) => void save({ request_model: v })}
             />
           </label>
-          <label className="flex flex-col gap-1">
-            <span className="text-ink-2">Model for fixing papers</span>
-<Select
-              value={settings.fix_model}
-              options={settings.models.map((m) => ({ value: m, label: MODEL_NAMES[m] ?? m }))}
-              onChange={(v) => void save({ fix_model: v })}
-            />
-          </label>
-          <label className="flex flex-col gap-1">
-            <span className="text-ink-2">Papers Claude fixes at once</span>
-            <Select
-              value={String(settings.fix_workers)}
-              options={Array.from({ length: settings.max_fix_workers }, (_, i) => ({ value: String(i + 1), label: String(i + 1) }))}
-              onChange={(v) => void save({ fix_workers: Number(v) })}
-            />
-            <span className="text-xs text-muted">
-              More is faster, and uses your plan's limit faster too. Changes take effect during a run.
-            </span>
-          </label>
-          <fieldset className="flex flex-col gap-1">
-            <legend className="mb-1 text-ink-2">When Claude fixes a paper</legend>
-            <label className="flex items-start gap-2">
-              <input
-                type="radio"
-                name="fix_mode"
-                className="mt-1"
-                checked={settings.fix_mode === 'auto'}
-                onChange={() => void save({ fix_mode: 'auto' })}
-              />
-              <span>
-                <span className="font-medium">Auto</span>
-                <span className="block text-xs text-muted">
-                  Apply a fix by itself when it clears its issue and raises none. Anything else waits for you.
-                </span>
-              </span>
-            </label>
-            <label className="flex items-start gap-2">
-              <input
-                type="radio"
-                name="fix_mode"
-                className="mt-1"
-                checked={settings.fix_mode === 'review'}
-                onChange={() => void save({ fix_mode: 'review' })}
-              />
-              <span>
-                <span className="font-medium">Review</span>
-                <span className="block text-xs text-muted">Every fix waits in the Reviewer for you to apply or reject.</span>
-              </span>
-            </label>
-          </fieldset>
         </div>
       )}
 
       <p className="mt-3 rounded-xl bg-info-wash px-3 py-2 text-xs leading-relaxed text-info">
-        What leaves this computer: to tag or fix, the extracted text of a paper’s questions (and, to fix, its mark scheme
-        rows) goes to Claude{onApi ? ', through the Anthropic API' : ''}. To read a request, only what you typed and the
+        What leaves this computer: to tag, the extracted text of a paper’s questions and their mark scheme answers goes
+        to Claude{onApi ? ', through the Anthropic API' : ''}. To read a request, only what you typed and the
         topic names are sent. Your PDFs are never uploaded.{' '}
         {onApi
           ? 'If tagging reaches the API’s rate limit it pauses, and “Tag the rest” carries on later.'
@@ -281,66 +268,6 @@ function SubjectRow({
   )
 }
 
-function TaggingProgress() {
-  const { tagging } = useLive()
-  const done = tagging.done ?? 0
-  const total = tagging.total ?? 0
-  const failed = tagging.failed ?? []
-  return (
-    <div className="mt-4 rounded-2xl border border-line bg-sunken px-4 py-3">
-      <div className="flex items-center gap-3 text-sm">
-        {tagging.running ? (
-          <Loader2 size={15} className="animate-spin text-accent" />
-        ) : tagging.paused ? (
-          <Pause size={15} className="text-warning" />
-        ) : (
-          <Check size={15} className="text-success" />
-        )}
-        <span className="font-medium">
-          {tagging.running
-            ? tagging.stage?.startsWith('Waiting for Claude')
-              ? tagging.stage
-              : total
-                ? `Tagging ${done.toLocaleString()} of ${total.toLocaleString()} questions`
-                : tagging.stage
-            : tagging.paused
-              ? `Paused after ${done.toLocaleString()} questions`
-              : `Tagged ${done.toLocaleString()} questions`}
-        </span>
-        {tagging.current && <span className="truncate text-xs text-muted">{tagging.current}</span>}
-        {tagging.running && (
-          <button className="btn-ghost ml-auto" onClick={() => void api.stopTagging()} disabled={tagging.stop}>
-            <Square size={12} /> {tagging.stop ? 'Stopping…' : 'Stop'}
-          </button>
-        )}
-      </div>
-      {total > 0 && (
-        <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-card">
-          <div className="h-full rounded-full bg-accent transition-[width]" style={{ width: `${(100 * done) / total}%` }} />
-        </div>
-      )}
-      {tagging.paused && (
-        <p className="mt-2 text-xs text-warning">{tagging.paused} Press “Tag the rest” then to carry on.</p>
-      )}
-      {tagging.error && <p className="mt-2 text-xs text-danger">{tagging.error}</p>}
-      {failed.length > 0 && (
-        <details className="mt-2 text-xs">
-          <summary className="cursor-pointer text-danger">
-            {failed.length} paper{failed.length === 1 ? '' : 's'} couldn’t be tagged - start again to retry them
-          </summary>
-          <ul className="mt-1 space-y-0.5 text-ink-2">
-            {failed.slice(0, 20).map((f) => (
-              <li key={f.paper_key}>
-                {f.paper_key}: {f.error}
-              </li>
-            ))}
-          </ul>
-        </details>
-      )}
-    </div>
-  )
-}
-
 function TopicEditor({ subject, keySet, onClose }: { subject: SubjectInfo; keySet: boolean; onClose: () => void }) {
   const [text, setText] = useState('')
   const [loaded, setLoaded] = useState(false)
@@ -370,7 +297,7 @@ function TopicEditor({ subject, keySet, onClose }: { subject: SubjectInfo; keySe
       const result = await api.topicsFromSyllabus(subject.subject, file)
       show(result.topics)
     } catch (e) {
-      setError((e as Error).message)
+      setError(errorMessage(e))
     } finally {
       setBusy(null)
     }
@@ -384,7 +311,7 @@ function TopicEditor({ subject, keySet, onClose }: { subject: SubjectInfo; keySe
       await api.saveTopics(subject.subject, topics)
       onClose()
     } catch (e) {
-      setError((e as Error).message)
+      setError(errorMessage(e))
       setBusy(null)
     }
   }

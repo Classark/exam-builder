@@ -13,6 +13,11 @@ _REMOVED_RE = re.compile(
     r"has been removed from (?:the|this) (?:question paper|paper|mark scheme|examination)", re.IGNORECASE
 )
 
+# an answer key's row for a withdrawn question: "Question Removed" in place of the letter
+# (markscheme.REMOVED_KEY, 0455/12 ON16 Q15)
+# or "Question Discounted" (0455/12 ON21 Q22)
+_KEY_REMOVED_RE = re.compile(r"^\s*question\s+(?:removed|discounted)\s*$", re.IGNORECASE)
+
 
 # the question it names: "Question 5", "question 5(a)", "question 14" - or "this question"
 _NAMED_RE = re.compile(r"issue with question\s*(\d{1,2})\s*((?:\([a-z]+\))*)", re.IGNORECASE)
@@ -30,7 +35,7 @@ def removed_target(text: str) -> tuple[int, str] | None:
 def is_removed_notice(text: str) -> bool:
     """The board's notice that a question was withdrawn after printing: "Due to an issue
     with Question 5, the question has been removed from the question paper." """
-    return bool(_REMOVED_RE.search(text or ""))
+    return bool(_REMOVED_RE.search(text or "")) or bool(_KEY_REMOVED_RE.match(text or ""))
 
 
 class Issue(BaseModel):
@@ -58,7 +63,7 @@ def validate_paper(paper: Paper) -> Report:
         # Only as an explanation of something else: a download with its blank pages stripped
         # is short of its cover's count too (0620/41 MJ24: printed pages 14-15, both blank),
         # and a paper that reconciles in full has lost nothing.
-        issues = _check_no_missing_pages(paper) + issues
+        issues = _check_no_missing_pages(paper) + _check_no_empty_pages(paper) + issues
     return Report(paper_key=paper.paper_key, passed=not issues, issues=issues)
 
 
@@ -81,6 +86,26 @@ def _check_no_missing_pages(paper: Paper) -> list[Issue]:
             )
         ]
     return []
+
+
+def _check_no_empty_pages(paper: Paper) -> list[Issue]:
+    """Real-paper finding (0452/11 ON16): pages with nothing on them at all, where the board
+    printed questions - the download is damaged. Like a missing page, only reported as the
+    explanation of another failure (pages.empty_pages)."""
+    if not paper.qp_empty_pages:
+        return []
+    pages = [p + 1 for p in paper.qp_empty_pages]
+    named = ", ".join(str(p) for p in pages[:-1]) + (" and " if len(pages) > 1 else "") + str(pages[-1])
+    return [
+        Issue(
+            check="qp_pages_empty",
+            detail=(
+                f"page{'s' if len(pages) > 1 else ''} {named} of the question paper PDF "
+                f"{'are' if len(pages) > 1 else 'is'} completely empty - the file is damaged, and "
+                "questions printed there can't be extracted"
+            ),
+        )
+    ]
 
 
 def _check_marks_known(paper: Paper) -> list[Issue]:
@@ -112,6 +137,11 @@ def _check_part_sums_to_question_total(paper: Paper) -> list[Issue]:
     issues = []
     for question in paper.questions:
         part_sum = sum(part.marks for part in question.parts)
+        # a part the board withdrew still counts in the printed [Total: n], at marks it no
+        # longer prints (0620/32 FM26 3(d)(iv): parts 13, "[Total: 14]")
+        withdrawn = any(part.removed for part in question.parts)
+        if withdrawn and part_sum < question.total_marks:
+            continue
         if question.parts and part_sum != question.total_marks:
             issues.append(
                 Issue(
@@ -129,7 +159,15 @@ def _check_question_totals_sum_to_cover(paper: Paper) -> list[Issue]:
     total = sum(q.total_marks for q in paper.questions)
     # a question withdrawn after printing still counts on the cover, at marks nothing prints
     # now (0478/22 MJ23: Q5's notice, 70 of the cover's 75)
-    unknown = any(q.removed and not q.total_marks for q in paper.questions)
+    unknown = any(q.removed and not q.total_marks for q in paper.questions) or bool(paper.withdrawn)
+    if paper.questions_answered and paper.questions_answered < len(paper.questions):
+        # a choice of questions: the cover counts the ones answered, so some set of that many
+        # questions makes it (0455/21 MJ26: Q1's 30 and three 20s of Q2-5, 90 of 110)
+        from itertools import combinations
+
+        totals = [q.total_marks for q in paper.questions]
+        if any(sum(c) == paper.cover_total_marks for c in combinations(totals, paper.questions_answered)):
+            return []
     if total != paper.cover_total_marks and not (unknown and total < paper.cover_total_marks):
         return [
             Issue(
@@ -141,7 +179,8 @@ def _check_question_totals_sum_to_cover(paper: Paper) -> list[Issue]:
 
 
 def _check_question_numbers_contiguous(paper: Paper) -> list[Issue]:
-    numbers = sorted(q.question_number for q in paper.questions)
+    # a question the board withdrew is dropped from the paper, but still has its number
+    numbers = sorted({q.question_number for q in paper.questions} | {int(w) for w in paper.withdrawn if w.isdigit()})
     expected = list(range(1, len(numbers) + 1))
     if numbers != expected:
         return [

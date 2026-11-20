@@ -18,6 +18,7 @@ from qbx.anchors import (
     AnchorSpan,
     TierResult,
     bottom_limit,
+    furniture_rows,
     is_horizontal_line,
     is_machine_readable_mark,
     is_page_furniture_text,
@@ -96,6 +97,10 @@ def _drop_out_of_sequence_questions(anchors: list[ResolvedAnchor]) -> list[Resol
     than demanding each be exactly one more than the last: a question whose number was
     missed mustn't take every later question with it.
     """
+    # Questions are numbered from 1: a "0" at the question column is a map's scale bar
+    # ("0 - 200 km", 0680/22 FM26's source material before Q1, user-reported - it became
+    # question 0, holding two pages of material)
+    anchors = [a for a in anchors if not (a.tier == "question" and int(a.label) == 0)]
     questions = [i for i, a in enumerate(anchors) if a.tier == "question"]
     numbers = [int(anchors[i].label) for i in questions]
     if not numbers:
@@ -153,6 +158,9 @@ def _drop_out_of_sequence_parts(anchors: list[ResolvedAnchor]) -> list[ResolvedA
     return kept
 
 
+_SIDEWAYS_MARK_RE = re.compile(r"^\s*\[\d{1,2}\]\s*$")
+
+
 def collect_text_spans(
     doc: object, content_pages: set[int] | None = None, margin: float = HEADER_FOOTER_MARGIN
 ) -> list[TextSpan]:
@@ -176,9 +184,21 @@ def collect_text_spans(
             page_height,
             margin,
         )
+        furniture = furniture_rows(
+            ("".join(s["text"] for s in line["spans"]), line["bbox"]) for b in blocks for line in b.get("lines", [])
+        )
         for block in blocks:
             for line in block.get("lines", []):
-                if not is_horizontal_line(line):
+                if tuple(line["bbox"]) in furniture:
+                    continue
+                # A page printed sideways prints its mark sideways too: 0452/21 MJ26's
+                # petty cash book closes with a sideways "[11]" at the right margin, and
+                # unread, 1(a) had no mark and (b)'s lead-in on the next page went to it
+                # (user-reported). Only the mark - other sideways text is the margin strip
+                # or a figure's labels, which have no place in reading order.
+                if not is_horizontal_line(line) and not _SIDEWAYS_MARK_RE.match(
+                    "".join(s["text"] for s in line["spans"])
+                ):
                     continue
                 line_y0 = row_tops.get(line["bbox"][1], line["bbox"][1])
                 if line_y0 < top_margin(margin) or line_y0 > page_bottom:
@@ -188,6 +208,8 @@ def collect_text_spans(
                 line_text = "".join(s["text"] for s in line["spans"])
                 if is_page_number(line_text, line["bbox"], page.rect.width, page_height):
                     continue
+                if is_page_furniture_text(line_text):
+                    continue  # a running header set in pieces ("... May/June 2016", "0478", "12")
                 for span in line["spans"]:
                     text = span["text"]
                     if DOTTED_LINE_RE.match(text.strip()) or is_page_furniture_text(text):
@@ -196,7 +218,9 @@ def collect_text_spans(
                         spans.append(
                             TextSpan(text=text, page=page_index, y0=line_y0, x0=span["bbox"][0])
                         )
-                        rights.append(span["bbox"][2])
+                        # a sideways mark is never an array index, wherever it ends: its
+                        # margin is the page's top (0452/23 MJ25's "[11]" ends at x 497)
+                        rights.append(span["bbox"][2] if is_horizontal_line(line) else float("inf"))
     return _without_array_indices(spans, rights)
 
 
@@ -344,6 +368,27 @@ def _has_nested_child(anchors: list[ResolvedAnchor], index: int, end: tuple | No
     return False
 
 
+# The board's notice for a question withdrawn after printing, set where the question was
+# with no number of its own: "Due to an issue with Question 22, the question has been removed
+# from the question paper." under Q21's options (0455/12 ON21; user-reported).
+_OTHER_REMOVAL_RE = re.compile(r"^\s*Due to an issue with Question\s*(\d{1,2})\b", re.IGNORECASE)
+
+
+def _before_other_removal_notice(
+    text_spans: list[TextSpan], start: tuple, end: tuple | None, question_number: int
+) -> tuple | None:
+    """`end`, or the start of a removal notice for some *other* question inside the range:
+    it's that question's place on the page, never this one's content. Read as this part's,
+    Q21 took the notice into its text and crop."""
+    for s in text_spans:
+        if s.position < start or (end is not None and s.position >= end):
+            continue
+        named = _OTHER_REMOVAL_RE.match(s.text)
+        if named and int(named.group(1)) != question_number:
+            return s.position
+    return end
+
+
 def _text_between(
     text_spans: list[TextSpan], start: tuple[int, float, float], end: tuple | None
 ) -> str:
@@ -401,8 +446,11 @@ def build_tree(
     explicit_total: set[str] = set()  # question keys with a real "[Total: n]" annotation
 
     starts = lead_in_starts(anchors, text_spans)
+    question_number = 0
     for i, anchor in enumerate(anchors):
-        end = _boundary_end(anchors, i, starts)
+        if anchor.tier == "question":
+            question_number = int(anchor.label)
+        end = _before_other_removal_notice(text_spans, starts[i], _boundary_end(anchors, i, starts), question_number)
         raw_text = _text_between(text_spans, starts[i], end)
         is_container = _has_nested_child(anchors, i, end)
 

@@ -645,7 +645,7 @@ def test_read_adjustment_keeps_only_what_the_exam_has():
     adj = read_adjustment(llm, "swap Q2 for electrolysis", items, ADJUST_SPEC, TOPICS)
     assert adj.remove == [1] and adj.remove_parts == {0: ["b"]}
     assert adj.topic_ids == ["4"] and adj.target is None and adj.question_style == "" and adj.summary == "Swap Q2"
-    assert "Q1: 4 marks, from X_24 question 3" in llm.calls[0][0]
+    assert "Q1: 4 marks, Medium, from X_24 question 3" in llm.calls[0][0]
 
 
 def test_adjusting_a_saved_exam_by_instruction(api):

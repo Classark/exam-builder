@@ -43,8 +43,8 @@ NOTICE_BODY = (
     "This program is distributed in the hope that it will be useful, but WITHOUT ANY "
     "WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A "
     "PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.\n\n"
-    "The complete source code of this version is included with it: use \"Download source "
-    "code\" in About & licences.\n\n"
+    "The complete source code of this version is included with it, as source.zip in the "
+    "app's own files (the qbx\\legal folder inside _internal).\n\n"
     "\"Classark\" and the Classark logo are trademarks of Classark. The licence covers the "
     "program's code, not the right to use them.\n"
 )

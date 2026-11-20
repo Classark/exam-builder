@@ -176,11 +176,22 @@ def open_outside_app(target: str) -> None:
         return
     try:
         subprocess.Popen(
-            ["cmd", "/c", "start", "", target],
+            open_command(target),
             creationflags=subprocess.CREATE_BREAKAWAY_FROM_JOB | subprocess.CREATE_NO_WINDOW,
         )
     except OSError:  # no job, or an outer one that forbids leaving it
         os.startfile(target)
+
+
+def open_command(target: str) -> list[str]:
+    """The Windows command that opens `target` in its own program. Never `cmd /c start`:
+    cmd reads `&` as "and then run", so the sign-in URL lost everything after its first
+    parameter and classark.com said the link wasn't valid (user-reported); a folder or
+    exam named "A & B" broke the same way. A URL goes to its handler, anything else to
+    Explorer, neither through a shell."""
+    if target.startswith(("http://", "https://")):
+        return ["rundll32", "url.dll,FileProtocolHandler", target]
+    return ["explorer", target]
 
 
 def main() -> None:
@@ -201,6 +212,9 @@ def main() -> None:
     os.environ.setdefault("QBX_QUIZZES_DIR", str(data / "quizzes"))
     # settings (whether Claude is on, which models) and syllabus topic lists
     os.environ.setdefault("QBX_CONFIG_DIR", str(data / "config"))
+    # where a Mac copy downloads and checks its next version (qbx/mac_update.py) - its own
+    # folder: the updater only ever writes and clears that, and the app it replaces
+    os.environ.setdefault("QBX_UPDATES_DIR", str(data / "updates"))
     os.environ.setdefault("QBX_UI_DIR", str(BUNDLE_DIR / "ui" / "dist"))
     (data / "out").mkdir(exist_ok=True)
     if not FROZEN:
@@ -213,6 +227,10 @@ def main() -> None:
 
     # sign-in opens the browser, which must not start inside the app's job and close with it
     account.set_opener(open_outside_app)
+    # saved exams open in the PDF reader, and their folder in Explorer, outside the job too
+    from qbx import saving
+
+    saving.set_opener(open_outside_app)
 
     port = free_port()
     url = f"http://127.0.0.1:{port}"
@@ -223,13 +241,23 @@ def main() -> None:
         # just the server - no window: for checking a build, or troubleshooting
         server.run()
         return
-    serving = threading.Thread(target=server.run, daemon=True)
+    def serve() -> None:
+        try:
+            server.run()
+        except BaseException:  # noqa: BLE001 - logged; the UI offers to restart the app
+            logging.exception("the server stopped")
+            raise
+        if not server.should_exit:
+            logging.error("the server stopped by itself")
+
+    serving = threading.Thread(target=serve, daemon=True, name="server")
     serving.start()
+    threading.Thread(target=_record_hangs, args=(server, log_file), daemon=True, name="hang-recorder").start()
     _app_window(server, url, data)
     serving.join(timeout=10)
     # The server stops ~0.2s after the window closes, but Python's own teardown then took
     # ~6s more on Windows (pywebview's .NET runtime), leaving the process behind as if it
-    # had hung. Scans, tagging and fixing run in daemon threads, which an ordinary exit
+    # had hung. Scans and tagging run in daemon threads, which an ordinary exit
     # abandons too, so leaving now skips nothing. Their worker processes go with the job
     # on Windows; elsewhere end them here.
     import multiprocessing
@@ -248,6 +276,42 @@ def main() -> None:
         kernel32.GetCurrentProcess.restype = ctypes.c_void_p
         kernel32.TerminateProcess(ctypes.c_void_p(kernel32.GetCurrentProcess()), 0)
     os._exit(0)
+
+
+# how long the server may go without a heartbeat before every thread's stack is written to
+# app.log, and how often it beats
+HANG_SECONDS = 20
+HEARTBEAT_SECONDS = 5
+
+
+def _record_hangs(server, log_file) -> None:
+    """If the app ever freezes again, say why in app.log (user-reported: the window wouldn't
+    even come back from minimised, and the server answered nothing for half an hour, with
+    nothing in the log to say where it was stuck).
+
+    The server's event loop re-arms faulthandler's timer every HEARTBEAT_SECONDS. That
+    timer runs in C, outside Python, so it still fires when some thread holds the
+    interpreter and nothing else can run: after HANG_SECONDS without a beat it writes
+    every Python thread's stack - the window's message hook included - to app.log, and
+    again every HANG_SECONDS while the hang lasts."""
+    import asyncio
+    import faulthandler
+
+    deadline = time.monotonic() + 60
+    while not server.started and time.monotonic() < deadline:
+        time.sleep(0.2)
+    try:
+        loop = server.servers[0].get_loop()
+    except (AttributeError, IndexError):
+        logging.warning("no hang recorder: the server's loop isn't reachable")
+        return
+
+    async def heartbeat() -> None:
+        while True:
+            faulthandler.dump_traceback_later(HANG_SECONDS, repeat=True, file=log_file)
+            await asyncio.sleep(HEARTBEAT_SECONDS)
+
+    asyncio.run_coroutine_threadsafe(heartbeat(), loop)
 
 
 def _unblock_bundle() -> None:
@@ -288,17 +352,13 @@ class Desktop:
     """What the UI can ask of the app window, as window.pywebview.api (pywebview's js_api;
     names starting with _ aren't exposed)."""
 
-    def __init__(self, data: Path, url: str) -> None:
+    def __init__(self, data: Path) -> None:
         self._data = data
-        self._url = url
         self._window = None
         self._own_title_bar = False
 
     def open_data_folder(self) -> None:
         open_outside_app(str(self._data))
-
-    def open_in_browser(self) -> None:
-        open_outside_app(self._url)
 
     def window_controls(self) -> bool:
         """Whether the UI's top bar is the title bar, and so draws minimise/maximise/close."""
@@ -314,9 +374,28 @@ class Desktop:
             self._window.maximize()
 
     def is_maximized(self) -> bool:
+        # WindowState is WinForms'; a Mac window keeps its own title bar and controls
+        if sys.platform != "win32":
+            return False
         return str(self._window.native.WindowState) == "Maximized"
 
     def close(self) -> None:
+        self._window.destroy()
+
+    def restart(self) -> None:
+        """Start a fresh copy of the app, then close this one: what the UI offers when the
+        engine has stopped answering. The new copy starts outside the app's job, or it would
+        end with this one, and finds a free port of its own."""
+        command = [sys.executable] if FROZEN else [sys.executable, str(Path(__file__).resolve())]
+        logging.warning("restarting the app at the teacher's request")
+        try:
+            if sys.platform == "win32":
+                subprocess.Popen(command, creationflags=subprocess.CREATE_BREAKAWAY_FROM_JOB)
+            else:
+                subprocess.Popen(command, start_new_session=True)
+        except OSError:
+            logging.exception("couldn't start a fresh copy of the app")
+            return
         self._window.destroy()
 
 
@@ -381,10 +460,20 @@ def _drag_regions() -> None:
     ready = EdgeChrome.on_webview_ready
 
     def on_webview_ready(self, sender, args):
+        settings = sender.CoreWebView2.Settings
         try:
-            sender.CoreWebView2.Settings.IsNonClientRegionSupportEnabled = True
+            settings.IsNonClientRegionSupportEnabled = True
         except Exception:  # noqa: BLE001 - an older WebView2: the bar just doesn't drag
             logging.exception("no drag regions in this WebView2")
+        # An app window, not a browser tab (user-asked): no reload (F5, Ctrl+R - it threw
+        # away what was on screen), print, find bar or browser zoom (Ctrl+= / Ctrl+wheel;
+        # the UI's own pinch magnifier stays), no link address in the bottom corner, no
+        # swiping back. Copy, paste and the rest of editing are not browser keys and stay.
+        for name in ("AreBrowserAcceleratorKeysEnabled", "IsZoomControlEnabled", "IsStatusBarEnabled", "IsSwipeNavigationEnabled"):
+            try:
+                setattr(settings, name, False)
+            except Exception:  # noqa: BLE001 - an older WebView2 without it: harmless
+                logging.warning("WebView2 has no %s", name)
         ready(self, sender, args)
 
     EdgeChrome.on_webview_ready = on_webview_ready
@@ -424,7 +513,7 @@ def _app_window(server, url: str, data: Path) -> None:
     # exported question papers and mark schemes are downloads; a webview refuses them
     # unless told otherwise (WebView2 saves to Downloads, WebKit asks where)
     webview.settings["ALLOW_DOWNLOADS"] = True
-    desktop = Desktop(data, url)
+    desktop = Desktop(data)
     window = webview.create_window(
         APP_NAME,
         url,
@@ -437,6 +526,18 @@ def _app_window(server, url: str, data: Path) -> None:
         js_api=desktop,
     )
     desktop._window = window
+
+    def pick_folder(start: str) -> str | None:
+        chosen = window.create_file_dialog(webview.FileDialog.FOLDER, directory=start)
+        if not chosen:
+            return None
+        return chosen if isinstance(chosen, str) else chosen[0]
+
+    from qbx import mac_update, saving
+
+    saving.set_folder_picker(pick_folder)
+    # "Restart to update" on a Mac: the swap starts once this window - and so the app - closes
+    mac_update.set_quitter(window.destroy)
     # On Windows the UI's own top bar carries what the File menu did, and a menu strip
     # under the title bar looked bolted on (user feedback); a Mac's menu bar is the norm.
     menu = []
@@ -448,15 +549,25 @@ def _app_window(server, url: str, data: Path) -> None:
             except Exception:  # noqa: BLE001 - the Windows caption stays, which still works
                 logging.exception("couldn't make the top bar the title bar")
 
+        def fill_screen() -> None:
+            # Windows replaces a program's first "show maximised" with the show state its
+            # launcher asked for - Explorer, the Start menu and shortcuts ask for "normal" -
+            # so maximized=True alone opened a restored window (user-reported). Measured:
+            # launched "Normal", the window wasn't zoomed; launched "Maximized", it was.
+            try:
+                window.maximize()
+            except Exception:  # noqa: BLE001 - the window still works at its restored size
+                logging.exception("couldn't maximise the window")
+
         _drag_regions()
         window.events.before_show += own_title_bar
+        window.events.shown += fill_screen
     else:
         menu = [
             Menu(
                 "File",
                 [
                     MenuAction("Open data folder", desktop.open_data_folder),
-                    MenuAction("Open in browser", desktop.open_in_browser),
                     MenuSeparator(),
                     MenuAction("Reload", lambda: window.load_url(url)),
                 ],

@@ -19,10 +19,12 @@ for whoever tags marks by type later): M1 (method), A1 (accuracy), B1 (independe
 """
 
 import re
+from collections import defaultdict
 
 import pymupdf
 from pydantic import BaseModel
 
+from qbx import markscheme_paper
 from qbx.anchors import page_blocks
 from qbx.schema import BBox, LabelRef, MarkSchemeEntry
 
@@ -38,9 +40,13 @@ ANNOTATION_CODES = {"ecf", "owtte", "AVP"}
 # More, from 0620 2019-2023: a capital in the numeral, "7(c)(Ii)" (0620/31 ON21); and a stray
 # "i" after the closing bracket, "6(a)(i)i" and "4(f)(iii)i" (0620/32 ON19, 0620/42 MJ23) -
 # the rows that follow, (ii) and (iv), say the numeral in brackets is the real one.
+# And from 0625 2016-2018: a doubled bracket, "7(a)((i)" (0625/41 MJ16); and one row in
+# numbered pieces, "1(a)(i)1" then "1(a)(i)2" (0625/41 ON18) - `piece`, see _entry_ids - or
+# lettered items, "6(a)(i)(a)", "6(a)(i)(b)" (0580/33 MJ19) - `item`.
 _LENIENT_LABEL_RE = re.compile(
     r"^(?P<question>\d{1,2})\s*\(?\s*(?P<part>[a-z])\s*\)?"
-    r"(?:\s*\(?\s*(?P<subpart>(?i:i|ii|iii|iv|v|vi|vii|viii))\s*\)?)?(?:(?<=\))[iI])?$"
+    r"(?:\s*\(*\s*(?P<subpart>(?i:i|ii|iii|iv|v|vi|vii|viii))\s*\)?(?:\((?P<item>[a-h])\))?)?"
+    r"(?:(?<=\))[iI]|(?<=\))(?P<piece>[1-9]))?$"
 )
 # A label printed without its question number, "(a)(ii)" under "2(a)(i)" (0620/33 MJ25).
 # `question` matches empty: _entry_ids gives it the question of the row above. A part letter
@@ -55,7 +61,13 @@ _QUESTIONLESS_LABEL_RE = re.compile(
 # went to the row above.
 _COMBINED_LABEL_RE = re.compile(
     r"^(?P<question>\d{1,2})\((?P<part>[a-z])\)(?P<subpart>)"
-    r"\((?:i|ii|iii|iv|v|vi|vii|viii)\)\s*(?:,|&|and|–|-)\s*\((?:i|ii|iii|iv|v|vi|vii|viii)\)$"
+    # or three: "2(b)(i),(ii),(iii)" (0625/61 ON17)
+    r"\((?:i|ii|iii|iv|v|vi|vii|viii)\)(?:\s*(?:,|&|and|–|-)\s*\((?:i|ii|iii|iv|v|vi|vii|viii)\))+$"
+)
+# One row for two parts, "2(a),(b)" (0625/52 and 53 MJ16, a table filled in for both): read
+# as the first, with the other in `also` - the entry's `also_paths`, which the join links too
+_COMBINED_PARTS_RE = re.compile(
+    r"^(?P<question>\d{1,2})\((?P<part>[a-z])\)(?P<subpart>)\s*(?:,|&|and)\s*\((?P<also>[a-z])\)$"
 )
 
 
@@ -63,8 +75,14 @@ def match_label(text: str) -> re.Match | None:
     """A row label, strictly formed or with one of the malformations above."""
     return (
         ROW_LABEL_RE.match(text) or _LENIENT_LABEL_RE.match(text) or _QUESTIONLESS_LABEL_RE.match(text)
-        or _COMBINED_LABEL_RE.match(text)
+        or _COMBINED_LABEL_RE.match(text) or _COMBINED_PARTS_RE.match(text) or _TABLE_ROW_LABEL_RE.match(text)
     )
+
+
+# A row of a table the question fills in, labelled by the table's own row - "11A", "11B",
+# "11C" for sequences A, B and C (0580/43 ON20) - is a lettered item of the question's row:
+# the paper marks question 11 once
+_TABLE_ROW_LABEL_RE = re.compile(r"^(?P<question>\d{1,2})(?P<part>)(?P<subpart>)(?P<item>[A-H])$")
 
 
 ROW_LABEL_RE = re.compile(
@@ -74,7 +92,8 @@ BARE_MARKS_RE = re.compile(r"^\d{1,2}$")
 # A Marks-column value. Real-paper finding (0620 w18 MS 41): "any three from:" rows carry
 # "max 3" in the Marks column instead of a bare digit, so requiring BARE_MARKS_RE there
 # rejected 3(d)(ii) and 6(a)(iii) as labels and merged their answers into the row above.
-MARKS_VALUE_RE = re.compile(r"^(?:max\s*)?(?P<marks>\d{1,2})$", re.IGNORECASE)
+# Older maths schemes glue follow-through to it: "1FT" (0580 2016).
+MARKS_VALUE_RE = re.compile(r"^(?:max\s*)?(?P<marks>\d{1,2})(?:\s*FT)?$", re.IGNORECASE)
 
 # Page furniture, not answer content. The last row of a mark scheme has no following row
 # label to stop at, so without this it swallows everything to the end of the document -
@@ -98,6 +117,11 @@ BOILERPLATE_RE = re.compile(
 # (see the module docstring); this is generous enough to swallow font-size jitter without
 # merging two adjacent, genuinely different rows, which are never closer than ~24pt.
 ROW_TOLERANCE = 4.0
+# How far above its label a row's own text may print and still be on the label's line
+_SAME_LINE = 2.0
+# ...or how far above a label centred in a two-line cell its row's first line may be: 6pt
+# measured (0580/11 MJ20, 0580/21 MJ21), rows ~12pt a line
+_CENTRED_LABEL_LEAD = 8.0
 
 
 class MSSpan(BaseModel):
@@ -112,6 +136,9 @@ class MSSpan(BaseModel):
     size: float = 10.0
     bold: bool = False
     font: str = ""
+    # a label whose row's mark is printed at the row's foot, beside its last marking point,
+    # rather than on its own line (older schemes with part cells - see _fill_part_cells)
+    marks_below: bool = False
 
     @property
     def position(self) -> tuple[int, float, float]:
@@ -132,14 +159,20 @@ _GUIDANCE_WORDS = (
     r"(?i:allow|accept|ignore|condone|reject|con|ora|owtte|not|max|ecf|do\s+not)"
 )
 _MARKS_THEN_CODE_RE = re.compile(
-    r"^(?P<marks>\d{1,2})\s+(?P<code>(?:(?:SC|[MABC])\d+|FT"
+    # "max 6 Ignore additional steps" too: 0620/61 and /62 MJ26 Q4, the planning question
+    # a code may carry its suffix, "4 B3FT for 7 or 8 correctly plotted points" (0580/31 MJ24)
+    r"^(?P<marks>(?:max\s*)?\d{1,2})\s+(?P<code>(?:(?:SC|[MABC])\d+(?:FT|oe|dep)?|FT"
     r"|" + _GUIDANCE_WORDS +
     # and the one-letter forms its abbreviations table defines - A allow, I ignore, R
     # reject - which 0620/42 MJ26 glues on too ("1 A 'sodium'"). Splitting one off is
     # harmless even where it'd be an answer letter: the two are separate columns anyway.
     r"|[AIR])\b.*"
     # or a note's heading: "4 Remember: Answers must be different" (0417/11 MJ26 Q1)
-    r"|[A-Z][a-z]+:.*)$"
+    r"|[A-Z][a-z]+:.*"
+    # or a guidance sentence: "6 Ticks must show where marks are awarded" (0620/62 MJ26 Q4)
+    # - a whole sentence, five words or more, so a short answer ("4 Remember the units")
+    # stays whole
+    r"|[A-Z][a-z]+(?:\s+[a-z]+,?){4,}.*)$"
 )
 # The same with a code in the marks' place: 0625 MJ26 schemes mark in codes only, and the
 # code runs into the guidance beside it ("B1 accept 4.4 (m/s)").
@@ -153,17 +186,32 @@ _CODE_THEN_GUIDANCE_RE = re.compile(
 # worth the sum of their digits. Only trusted *in* the Marks column: the same codes fill the
 # Answer and Partial Marks columns of every maths scheme.
 MARK_CODE_RE = re.compile(r"^(?:SC|[MABC])(?P<marks>\d)$")
+# A question number run into its first marking point, "4 MP1" (0625/53 MJ17's planning
+# question): split like a mark and its code, so the number stands as the row's label
+_NUMBER_THEN_POINT_RE = re.compile(r"^(?P<marks>\d{1,2})\s+(?P<code>MP\d{1,2}\b.*)$")
 # Codes are left-aligned where numbers are right-aligned, so a code in the Marks column is
 # placed by its right edge: measured 2pt from the numbers' right edge in 0580 m25 MS 22,
 # against 27pt for the nearest Partial Marks code.
 MARK_CODE_EDGE_TOLERANCE = 6.0
 
 
+# Two marks in one cell, one per answer: "1, 1" (0580/32 MJ16 1(d), "145" and "155")
+_MARKS_LIST_RE = re.compile(r"^\d(?:\s*,\s*\d)+$")
+
+
 def _split_marks_and_code(span: dict) -> list[dict]:
     """Splits a "2 B1"-style span into its marks value and the code after it, positioning
-    the code by the measured width of what precedes it."""
+    the code by the measured width of what precedes it; and "1, 1" into its marks."""
     text = span["text"].strip()
-    match = _MARKS_THEN_CODE_RE.match(text) or _CODE_THEN_GUIDANCE_RE.match(text)
+    if _MARKS_LIST_RE.match(text):
+        x0, y0, x1, y1 = span["bbox"]
+        return [
+            {**span, "text": value, "bbox": (x0, y0, x1, y1)}
+            for value in re.findall(r"\d", text)
+        ]
+    match = (
+        _MARKS_THEN_CODE_RE.match(text) or _CODE_THEN_GUIDANCE_RE.match(text) or _NUMBER_THEN_POINT_RE.match(text)
+    )
     if not match:
         return [span]
     x0, y0, x1, y1 = span["bbox"]
@@ -178,14 +226,102 @@ def _split_marks_and_code(span: dict) -> list[dict]:
     ]
 
 
-def _rotated_spans(doc: object) -> list[MSSpan]:
+# Older schemes bracket the Marks column: "[3]", "[max 3]", "[max. 1]" (0610 2016, every
+# theory and practical paper - none of their rows joined). Read as the bare "3" / "max 3"
+# newer ones print; "[Total: 10]" stays as it is.
+_BRACKETED_MARKS_RE = re.compile(r"^\[\s*(?P<max>max\.?\s*)?(?P<marks>\d{1,2})\s*\]$", re.IGNORECASE)
+
+
+def _unbracketed(text: str) -> str:
+    match = _BRACKETED_MARKS_RE.match(text)
+    if not match:
+        return text
+    return f"max {match['marks']}" if match["max"] else match["marks"]
+
+
+# Characters this close (pt) are drawn touching, in one run of text
+_TOUCHING = 1.0
+# Two tiles' copies of one font can differ in size by a rounding error: 0680/11 MJ16's
+# Q3 page has 11.001 beside 10.995, which cut "3(a)(i)" into "3(" + "a)(i)" - Q3's rows
+# went unread and onto 2(b). A superscript is half the size.
+_SAME_SIZE = 0.25
+
+
+def _tiled_blocks(page: pymupdf.Page) -> list[dict] | None:
+    """A page drawn in overlapping tiles, its text rebuilt from characters - or None when
+    the page isn't one.
+
+    Real-paper finding (0625/42 MJ17, page 9 - question 10's only page): every word comes
+    back cut in pieces at the tiles' edges, "1" + "0(a)", "10" + "0(c)(i)", "Que" + "estion",
+    with a character on a seam drawn twice (the "0" of "10" again as the "0" of "0(c)(i)").
+    No label read, and the question went unjoined. Told apart by that: the same character
+    at the same place in two spans. Each such character is kept once, and touching
+    characters on a row are joined into one span."""
+    matrix = page.rotation_matrix
+    chars, seen, doubled = [], set(), False
+    for block in page.get_text("rawdict")["blocks"]:
+        for line in block.get("lines", []):
+            for span in line["spans"]:
+                for char in span["chars"]:
+                    upright = pymupdf.Rect(char["bbox"]) * matrix
+                    key = (char["c"], round(upright.x0, 1), round(upright.y0, 1))
+                    if key in seen:
+                        doubled = doubled or not char["c"].isspace()
+                        continue
+                    seen.add(key)
+                    origin = pymupdf.Point(char["origin"]) * matrix
+                    chars.append((origin.y, upright.x0, upright.x1, char, span))
+    if not doubled:
+        return None
+    chars.sort(key=lambda c: (round(c[0], 1), c[1]))
+    rows: list[list] = []
+    for char in chars:
+        if rows and abs(char[0] - rows[-1][0][0]) <= ROW_TOLERANCE / 4:
+            rows[-1].append(char)
+        else:
+            rows.append([char])
+    spans = []
+    for row in rows:
+        row.sort(key=lambda c: c[1])
+        run = [row[0]]
+        for char in row[1:] + [None]:
+            if char is not None and char[3]["c"] == run[-1][3]["c"] and char[1] < run[-1][2] - _TOUCHING:
+                continue  # a seam's character drawn again, a little off the first
+            if (
+                char is not None
+                and char[1] - run[-1][2] <= _TOUCHING
+                and abs(char[4]["size"] - run[-1][4]["size"]) <= _SAME_SIZE
+            ):
+                run.append(char)
+                continue
+            rects = [pymupdf.Rect(c[3]["bbox"]) for c in run]
+            box = rects[0]
+            for rect in rects[1:]:
+                box |= rect
+            first = run[0][4]
+            spans.append({
+                "text": "".join(c[3]["c"] for c in run),
+                "bbox": tuple(box),
+                "origin": run[0][3]["origin"],
+                "size": first["size"],
+                "flags": first["flags"],
+                "font": first.get("font", ""),
+            })
+            run = [char]
+    return [{"lines": [{"spans": [span]} for span in spans]}]
+
+
+def _rotated_spans(doc: object, unbracket: bool = False) -> list[MSSpan]:
+    """`unbracket` reads Cambridge's bracketed marks bare. Not for Edexcel: International A
+    Level's "[3]" is a part's total (WME02 June 2022 read 7(a)'s marks twice)."""
     spans = []
     for page_index, page in enumerate(doc):
         matrix = page.rotation_matrix
-        for block in page_blocks(page):
+        for block in _tiled_blocks(page) or page_blocks(page):
             for line in block.get("lines", []):
                 for span in (piece for raw in line["spans"] for piece in _split_marks_and_code(raw)):
                     text = span["text"].strip()
+                    text = _unbracketed(text) if unbracket else text
                     if not text:
                         continue
                     point = pymupdf.Point(span["bbox"][0], span["bbox"][1]) * matrix
@@ -262,40 +398,196 @@ def _codes_only(spans: list[MSSpan]) -> bool:
 # rest of its label: "3" then "(a)" 5.6pt on, "3" then "(b)(i)" 5.5pt (0625/61 MJ26); the
 # Answer column starts ~40pt further on
 _LABEL_PIECE_GAP = 12.0
+# ...or further, when the piece is nothing but part markers: older schemes give the number
+# and the part cells of their own - "4" at x 81, "(a) (i)" at x 129 (0610 2016, 48pt) -
+# and an answer is never just "(a) (i)"
+_LABEL_CELL_GAP = 70.0
+_ONLY_MARKERS_RE = re.compile(r"^(?:\(\s*(?:[a-z]|[ivx]+)\s*\)\s*){1,3}$")
 
 
 def _join_split_labels(spans: list[MSSpan]) -> list[MSSpan]:
     """A label set as two spans - its number, then "(a)" or "(b)(i)" - joined back into one.
     0625/61 MJ26 prints most of question 3 this way; each piece alone read as question 3's
-    own row, three times over, and the parts went unjoined."""
-    out = []
-    used = set()
+    own row, three times over, and the parts went unjoined.
+
+    The pieces are looked for along the whole printed row, not just the spans next in the
+    file: 0610/42 MJ18's text layer stores "3" and "(a)(i)" - and "2(" and "(b)(ii)", the
+    bracket split off - far apart, and a stray "3" left alone became the Question column."""
+    spans = _glued_brackets(spans)
+    by_row: dict[tuple[int, float], list[int]] = {}
+    for index, span in enumerate(spans):
+        by_row.setdefault((span.page, span.y), []).append(index)
+
+    def row_of(span: MSSpan) -> list[int]:
+        return [
+            j for dy in range(-int(ROW_TOLERANCE), int(ROW_TOLERANCE) + 1)
+            for j in by_row.get((span.page, span.y + dy), [])
+        ]
+
+    # a part cell is inside the Question column: up to its heading's right edge (0610 2016,
+    # parts at x 93-130 under "Question" ending ~150); 0625/31 MJ26's "(a)" 170pt out is an
+    # answer's
+    heading_right: dict[int, float] = {}
+    for span in spans:
+        if span.text.split() and span.text.split()[0] == "Question":
+            heading_right[span.page] = max(heading_right.get(span.page, 0.0), span.bbox[2])
+    joined: dict[int, MSSpan] = {}
+    used: set[int] = set()
+    part_cells: list[float] = []  # x of part cells joined across the wide gap
     for i, span in enumerate(spans):
-        if i in used:
+        number = _SPLIT_NUMBER_RE.match(span.text)
+        if i in used or not number:
             continue
-        if BARE_MARKS_RE.match(span.text):
-            for j in range(i + 1, min(i + 4, len(spans))):
-                piece = spans[j]
-                if (
-                    j not in used
-                    and piece.page == span.page
-                    and abs(piece.y - span.y) <= ROW_TOLERANCE
-                    and 0 < piece.x - span.x <= _LABEL_PIECE_GAP
-                    and piece.text.startswith("(")
-                    and match_label(span.text + piece.text)
-                ):
-                    used.add(j)
-                    span = span.model_copy(update={
-                        "text": span.text + piece.text,
-                        # the row starts at its higher piece, or text beside it sorts above
-                        "y": min(span.y, piece.y),
-                        "bbox": (
-                            min(span.bbox[0], piece.bbox[0]), min(span.bbox[1], piece.bbox[1]),
-                            max(span.bbox[2], piece.bbox[2]), max(span.bbox[3], piece.bbox[3]),
-                        ),
-                    })
-                    break
-        out.append(span)
+        opened = span.text.endswith("(")
+        for j in sorted(row_of(span), key=lambda k: spans[k].x):
+            piece = spans[j]
+            gap = piece.x - span.x
+            if (
+                j != i
+                and j not in used
+                and 0 < gap <= (
+                    _LABEL_CELL_GAP
+                    if opened or (
+                        _ONLY_MARKERS_RE.match(piece.text)
+                        # a page without the heading (0610/52 MJ16 pp.2-3) uses the others'
+                        and piece.x <= heading_right.get(piece.page, max(heading_right.values(), default=0.0)) + 10
+                    )
+                    else _LABEL_PIECE_GAP
+                )
+                and piece.text.startswith("(")
+                and match_label(number["number"] + piece.text)
+            ):
+                used.add(j)
+                if gap > _LABEL_PIECE_GAP and not opened:
+                    part_cells.append(piece.x)
+                joined[i] = span.model_copy(update={
+                    "text": number["number"] + piece.text,
+                    # the row starts at its higher piece, or text beside it sorts above
+                    "y": min(span.y, piece.y),
+                    "bbox": (
+                        min(span.bbox[0], piece.bbox[0]), min(span.bbox[1], piece.bbox[1]),
+                        max(span.bbox[2], piece.bbox[2]), max(span.bbox[3], piece.bbox[3]),
+                    ),
+                })
+                break
+    out = [joined.get(i, span) for i, span in enumerate(spans) if i not in used or i in joined]
+    # only a scheme laid out that way - most of its joined labels across the gap, as every
+    # 0610 2016 scheme is; 0625 MJ26 joins "3" "(a)" 5pt apart, with a couple further
+    wide = len(part_cells) >= 2 and len(part_cells) >= len(joined) / 2
+    column_right = max(heading_right.values(), default=0.0)
+    if wide:
+        return _fill_part_cells(out, part_cells, column_right)
+    # Or with the number and its first part in one cell, "14 (a)", "15 (a) (i)", and the
+    # rows after printing only "(b)" or "(ii)", set in from the number but still under the
+    # "Question" heading (0580 2016 schemes: "(b)" at x 58, "(ii)" at 77, numbers at 37, the
+    # heading ending at 93 and answers at 108). Unread, every such row merged into the one
+    # above and its part went unjoined.
+    numbers_x: dict[int, float] = {}
+    for span in out:
+        if (label := match_label(span.text)) and label.group("question") and span.page in heading_right:
+            numbers_x[span.page] = min(numbers_x.get(span.page, span.x), span.x)
+    lone = [
+        span.x for span in out
+        if span.page in numbers_x
+        and _ONLY_MARKERS_RE.match(span.text)
+        and numbers_x[span.page] + _LONE_CELL_INSET <= span.x <= heading_right[span.page] + 10
+    ]
+    if len(lone) >= _LONE_CELLS:
+        return _fill_part_cells(out, lone, column_right)
+    return out
+
+
+# A lone part cell is set this far in from the question numbers, at least ("(b)" 21pt in);
+# and a scheme needs this many to be laid out so
+_LONE_CELL_INSET = 10.0
+_LONE_CELLS = 3
+
+
+def _glued_brackets(spans: list[MSSpan]) -> list[MSSpan]:
+    """A part marker whose bracket is a span of its own, "(" then "b)", touching (0610/31
+    MJ16 6(b)) - one span again. Matched by position: the file can store them apart."""
+    gone: set[int] = set()
+    out = list(spans)
+    for i, bracket in enumerate(spans):
+        if bracket.text != "(":
+            continue
+        for j, span in enumerate(spans):
+            if (
+                j != i and j not in gone
+                and span.page == bracket.page
+                and abs(span.y - bracket.y) <= ROW_TOLERANCE
+                and -2 <= span.bbox[0] - bracket.bbox[2] <= 2
+                and _ONLY_MARKERS_RE.match("(" + span.text)
+            ):
+                out[i] = span.model_copy(update={
+                    "text": "(" + span.text,
+                    "bbox": (bracket.bbox[0], min(bracket.bbox[1], span.bbox[1]), span.bbox[2], max(bracket.bbox[3], span.bbox[3])),
+                })
+                gone.add(j)
+                break
+    return [span for k, span in enumerate(out) if k not in gone]
+
+
+# a question number on its own, or with its bracket split from the part ("2(" + "(b)(ii)")
+_SPLIT_NUMBER_RE = re.compile(r"^(?P<number>\d{1,2})\(?$")
+
+
+_ROMAN_MARKERS = ("i", "ii", "iii", "iv", "v", "vi", "vii", "viii")
+
+
+def _fill_part_cells(spans: list[MSSpan], part_cells: list[float], column_right: float = 0.0) -> list[MSSpan]:
+    """In a scheme whose part cells stand apart from the question number (see
+    _LABEL_CELL_GAP), a row further down the same question prints only its part cell -
+    "(ii)", "(b)", "(c) (i)" - under "4 (a) (i)". Each is written out in full from the label
+    above it ("4(a)(ii)"), but only at the part cells' own x, so an answer's "(ii)" is never
+    taken for one - between the question number and the part cell only."""
+    # the furthest: a lone "(a)" sits at x 111, "(b) (i)" at 130 (0610/33 MJ16)
+    cell_x = max(part_cells)
+    # out to the Question column's edge where the heading gives it: "(c) (i)" at x 119
+    # when every joined part cell was a lone letter at 100 (0610/53 MJ16)
+    reach = max(cell_x + 15, column_right + 10)
+    order = sorted(range(len(spans)), key=lambda k: (spans[k].page, spans[k].y, spans[k].x))
+    question = part = sub = None
+    number_page = -1
+    number_x = 0.0
+    out = list(spans)
+    for k in order:
+        span = spans[k]
+        full = ROW_LABEL_RE.match(span.text.replace(" ", "")) or _LENIENT_LABEL_RE.match(span.text)
+        # only one in the Question column, left of the part cells: Guidance can cite another
+        # part ("1(f)" at x 607, 0610/62 FM16), and that moved the count on
+        if full and full.group("question") and span.x < cell_x - 15:
+            question, part, sub = full.group("question"), full.group("part"), full.group("subpart")
+            number_x, number_page = span.x, span.page
+            out[k] = span.model_copy(update={"marks_below": True})
+            continue
+        # anywhere from just past the number to the part cell: a lone "(c)" sits 19pt left of
+        # "(a) (i)" (centred in its cell); the Answer column starts ~50pt right of it
+        # ...or at the number's own indent on a page with no number to set it in from: "(d) (i)"
+        # at x 48, under "10 (a)" at 48 the page before (0580/43 MJ16)
+        start = number_x - LABEL_COLUMN_SLACK if span.page != number_page else number_x
+        if question is None or not (start < span.x <= reach) or not _ONLY_MARKERS_RE.match(span.text):
+            continue
+        tokens = re.findall(r"\(\s*([a-z]+)\s*\)", span.text)
+        new_part, new_sub = part, None
+        for n, token in enumerate(tokens):
+            # a numeral is a subpart while there's a part letter to hang it on - unless it's
+            # the letter after (h), part (i), first in its cell
+            roman = token in _ROMAN_MARKERS and part is not None and not (n == 0 and token == "i" and part == "h")
+            if n == 0 and not roman:
+                new_part = token
+            else:
+                new_sub = token
+        if new_part is None:
+            continue
+        part, sub = new_part, new_sub
+        text = f"{question}({part})" + (f"({sub})" if sub else "")
+        # set where the question's number is, as the label it stands for
+        shift = span.x - number_x
+        out[k] = span.model_copy(update={
+            "text": text, "x": number_x, "marks_below": True,
+            "bbox": (span.bbox[0] - shift, span.bbox[1], span.bbox[2], span.bbox[3]),
+        })
     return out
 
 
@@ -316,9 +608,24 @@ def _has_marks_partner(candidate: MSSpan, spans: list[MSSpan], codes: bool = Fal
     closer than ~24pt, so ROW_TOLERANCE separates them with room to spare.
     """
     headers = _marks_headers(spans) if codes else {}
+    if candidate.marks_below:
+        # its mark is anywhere down its row: before the next label on the page
+        below = [
+            s.y for s in spans
+            if s.page == candidate.page and s.marks_below and s.y > candidate.y + ROW_TOLERANCE
+        ]
+        end = min(below, default=float("inf"))
+        return any(
+            s.page == candidate.page
+            and candidate.y - ROW_TOLERANCE <= s.y < end
+            and s.x > candidate.x
+            and MARKS_VALUE_RE.match(s.text)
+            for s in spans
+        )
     return any(
         s.page == candidate.page
-        and abs(s.y - candidate.y) <= ROW_TOLERANCE
+        # or on the line above, the label centred in a two-line cell (see parse_mark_scheme)
+        and candidate.y - _CENTRED_LABEL_LEAD <= s.y <= candidate.y + ROW_TOLERANCE
         and s.x > candidate.x
         and (_is_row_code(s, headers) if codes else MARKS_VALUE_RE.match(s.text))
         for s in spans
@@ -346,14 +653,39 @@ def _leftmost_cluster(candidates: list[MSSpan], tolerance: float = 15.0) -> list
     """
     if not candidates:
         return []
-    ordered = sorted(candidates, key=lambda s: s.x)
-    groups = [[ordered[0]]]
-    for span in ordered[1:]:
-        if span.x - groups[-1][-1].x <= tolerance:
-            groups[-1].append(span)
-        else:
-            groups.append([span])
-    return groups[0]
+    # page by page: 0610/42 MJ18 sets one page 25pt left of the rest, and its labels alone
+    # made "the leftmost column" - every other page's rows were dropped. But only near the
+    # column the pages share: a page with no label at all has answer numbers leftmost
+    # ("11", "12" at x 216 against the labels' 98, 0478/22 ON21)
+    firsts = []
+    for page in sorted({s.page for s in candidates}):
+        ordered = sorted((s for s in candidates if s.page == page), key=lambda s: s.x)
+        groups = [[ordered[0]]]
+        for span in ordered[1:]:
+            if span.x - groups[-1][-1].x <= tolerance:
+                groups[-1].append(span)
+            else:
+                groups.append([span])
+        firsts.append(groups[0])
+    xs = sorted(group[0].x for group in firsts)
+    usual = xs[len(xs) // 2]
+
+    def lettered(group: list[MSSpan]) -> bool:
+        return any((match := match_label(span.text)) and match.group("part") for span in group)
+
+    # within the usual column's own spread, as before; a page set further off must show a
+    # real label - a trace table's bare "0"s, 27pt right of the labels, don't (0478/23 MJ24)
+    return [
+        span
+        for group in firsts
+        if abs(group[0].x - usual) <= tolerance
+        or (abs(group[0].x - usual) <= _PAGE_COLUMN_SHIFT and lettered(group))
+        for span in group
+    ]
+
+
+# How far one page's Question column may sit from the others': 25pt (0610/42 MJ18 p.6)
+_PAGE_COLUMN_SHIFT = 40.0
 
 
 # Values in the Marks column are right-aligned, so "max 2" starts a few pt left of a bare
@@ -383,7 +715,54 @@ def _marks_column_x(labels: list[MSSpan], spans: list[MSSpan]) -> float:
     return xs[len(xs) // 2] if xs else 0.0
 
 
-def _row_marks(column_spans: list[MSSpan]) -> int:
+def _has_partial_marks_column(spans: list[MSSpan]) -> bool:
+    """A "Partial Marks" column beside Marks (Mathematics): "Partial" and "Marks" on one line."""
+    lines: dict[tuple, list[str]] = defaultdict(list)
+    for s in spans:
+        lines[(s.page, round(s.y))].append(s.text.strip().lower())
+    return any("partial marks" in " ".join(words) for words in lines.values())
+
+
+# Labels a page needs, each with a mark beside it, to set its own Marks column; how closely
+# most of their marks must line up; and how far from the document's column it may be - a
+# Partial Marks column's numbers start 50pt+ further right
+_PAGE_COLUMN_LABELS = 3
+_PAGE_COLUMN_AGREE = 3.0
+_PAGE_COLUMN_REACH = 30.0
+
+
+def _page_marks_columns(labels: list[MSSpan], spans: list[MSSpan], document_x: float) -> dict[int, float]:
+    """The Marks column per page, where a page has enough marked rows to say: one scheme
+    can set it in two places - 0580/33 MJ20 at x 315 on pages 3-4 and 298 on 5-6, so every
+    mark on the later pages fell outside the document's column and read 0 (found by
+    `qbx audit`)."""
+    out = {}
+    for page in {label.page for label in labels}:
+        mine = [label for label in labels if label.page == page]
+        marked = [
+            label for label in mine
+            if any(
+                s.page == page and abs(s.y - label.y) <= ROW_TOLERANCE and s.x > label.x
+                and MARKS_VALUE_RE.match(s.text)
+                for s in spans
+            )
+        ]
+        if len(marked) < _PAGE_COLUMN_LABELS:
+            continue
+        x = _marks_column_x(marked, spans)
+        rightmost = [
+            max(s.x for s in spans
+                if s.page == page and abs(s.y - label.y) <= ROW_TOLERANCE and s.x > label.x
+                and MARKS_VALUE_RE.match(s.text))
+            for label in marked
+        ]
+        agree = sum(abs(r - x) <= _PAGE_COLUMN_AGREE for r in rightmost)
+        if agree * 2 > len(rightmost) and abs(x - document_x) <= _PAGE_COLUMN_REACH:
+            out[page] = x
+    return out
+
+
+def _row_marks(column_spans: list[MSSpan], partial_marks: bool = False) -> int:
     """Real-paper finding (0620 w18 MS 41): some mark schemes print one value per marking
     point - M1..M5 each with its own "1" in the Marks column - rather than a single row
     total, so taking one value read a 5-mark row as 1 (MS total 65 vs the paper's 80).
@@ -392,6 +771,22 @@ def _row_marks(column_spans: list[MSSpan]) -> int:
     capped = [s for s in column_spans if s.text.lower().startswith("max")]
     if capped:
         return int(MARKS_VALUE_RE.match(capped[0].text)["marks"])
+    # A row whose Marks cell holds a number is worth the number: a code beside it is part
+    # credit or its breakdown, never more marks. Mathematics prints "3" | "B2 for 4x + 6 = 30"
+    # in its Partial Marks column, the code's left edge 10pt from the number's right, and
+    # every such row read 5 (0580/41 MJ22, found by `qbx audit`: 62 rows on Paper 4 alone).
+    numbers = [s for s in column_spans if not MARK_CODE_RE.match(s.text) and MARKS_VALUE_RE.match(s.text)]
+    # Marks are set in bold; a plain number beside them is answer content - the Partial
+    # Marks column's fractions ("2" over "12", in Times, 0580/41 MJ22 7(d) read 18 for 4;
+    # 0580/43 MJ20 11(e) 16 for 2) reach into the Marks column. Several bold numbers are
+    # several marks (0580/42 ON20 1(b)(ii): "1" and "2" for two answer lines). Only beside
+    # a Partial Marks column: elsewhere a plain "1" in line with the rest is a mark the
+    # board set plain (0620/53 MJ20 2(f)).
+    if partial_marks and any(s.bold for s in numbers) and not all(s.bold for s in numbers):
+        numbers = [s for s in numbers if s.bold]
+        column_spans = [s for s in column_spans if s.bold or MARK_CODE_RE.match(s.text)]
+    if numbers and len(numbers) < len(column_spans):
+        column_spans = numbers
     # A C (compensatory) mark under an A mark worth the whole calculation ("A2", "A3") is part
     # credit *instead of* it, never on top: "A2" over "C1" is worth 2. The bracketed "(C1)" of
     # newer schemes isn't read as a code at all; 0625/41 MJ21 prints it bare, and every such
@@ -457,7 +852,63 @@ LABEL_COLUMN_SLACK = 6.0
 
 
 def _is_column_code(span: MSSpan, column_right: float) -> bool:
-    return bool(MARK_CODE_RE.match(span.text)) and abs(span.bbox[2] - column_right) <= MARK_CODE_EDGE_TOLERANCE
+    # Its right edge measured from the text: a span's box can run on over spaces stripped
+    # from its text - "M1" 29pt wide, its ink ending 13pt sooner (0580/11 MJ24 Q22, a Marks
+    # cell of "M1", "A1", "A1" and no number)
+    # - or over spaces before it, "M1" boxed from 316 to 351 (0580/11 MJ25 Q17): either edge
+    measured = min(span.bbox[2], span.x + pymupdf.get_text_length(span.text, fontsize=span.size))
+    return bool(MARK_CODE_RE.match(span.text)) and any(
+        abs(right - column_right) <= MARK_CODE_EDGE_TOLERANCE for right in (span.bbox[2], measured)
+    )
+
+
+# How far below a question number its row's first mark may start: 0625 Paper 5/6's planning
+# question prints "4" alone, then "MP1 ... | 1" 25pt lower
+_FIRST_MARK_BELOW = 40.0
+# How far left of the "Question" header, or right of its start, the column's labels sit:
+# "4" at x 92 and "3(a)" at 101 under "Question" at 115
+_QUESTION_HEADER_REACH = (-40.0, 10.0)
+
+
+def _numbers_marked_below(spans: list[MSSpan]) -> list[MSSpan]:
+    """Labels heading a row whose marks start on a line further down - the planning question
+    of 0625 Papers 5 and 6 (2016-2018): "4" alone, then marking points "MP1", "MP2"... each
+    with its mark; and "2(a),(b)" over a table, its first mark a line lower (0625/52 MJ16). With no mark on its own line it had no partner, its
+    page held no other label, and the question went unjoined. Only under a page's
+    "Question" | "Marks" header, in the Question column, with a mark under the Marks header
+    within _FIRST_MARK_BELOW and no other label in between."""
+    headers = _marks_headers(spans)
+    question_x = {
+        s.page: s.x for s in spans
+        if s.page in headers and s.text.split()[:1] == ["Question"]
+    }
+    low, high = _QUESTION_HEADER_REACH
+    out = []
+    for span in spans:
+        if (
+            span.page not in question_x
+            or not (label := match_label(span.text))
+            or label.group("question") in ("", "0")
+            or not question_x[span.page] + low <= span.x <= question_x[span.page] + high
+        ):
+            continue
+        below = sorted(
+            (s for s in spans if s.page == span.page and span.y + ROW_TOLERANCE < s.y <= span.y + _FIRST_MARK_BELOW),
+            key=lambda s: s.y,
+        )
+        first_mark = next(
+            (s for s in below if (MARKS_VALUE_RE.match(s.text) or MARK_CODE_RE.match(s.text)) and _under_header(s, headers)),
+            None,
+        )
+        if first_mark is None:
+            continue
+        if any(
+            match_label(s.text) and s.y < first_mark.y - ROW_TOLERANCE and s.x <= question_x[span.page] + high
+            for s in below
+        ):
+            continue
+        out.append(span)
+    return out
 
 
 def _find_labels(all_spans: list[MSSpan]) -> tuple[list[MSSpan], list[MSSpan]]:
@@ -476,6 +927,8 @@ def _find_labels(all_spans: list[MSSpan]) -> tuple[list[MSSpan], list[MSSpan]]:
         for s in all_spans
         if s.page in headed and (match := match_label(s.text)) and match.group("question") and match.group("part")
     }
+    numbered = _numbers_marked_below(all_spans)
+    content_pages |= {s.page for s in numbered}
     spans = [s for s in all_spans if s.page in content_pages]
     shaped = [s for s in spans if match_label(s.text)]
     labels = _leftmost_cluster([s for s in shaped if _has_marks_partner(s, spans, codes)])
@@ -518,16 +971,21 @@ def _find_labels(all_spans: list[MSSpan]) -> tuple[list[MSSpan], list[MSSpan]]:
             and match_label(s.text).group("question") in questions
         ]
         labels = labels + blank_marks
+    found = {label.position for label in labels}
+    labels = labels + [s for s in numbered if s.position not in found]
 
     # A row has one label, its leftmost. Real-paper finding (0620/33 ON19): an answer that is
     # just a number - "5" beside 2(d)(ii), "36" beside 5(b)(iv) - starts the Answer column a
     # couple of dozen points right of the label, and labels' own x spreads enough (86-105pt
     # here) for the Question-column cluster to chain out to it. Each became a row "5" /
     # "36" of its own, splitting its real row and leaving an orphan.
+    # No question is numbered 0: a running header broken into pieces, "0" then "478/12" at the
+    # top of 0478/12 FM17's page 2, read as question 0 with the "12" for its mark
     labels = [
         label
         for label in labels
-        if not any(
+        if match_label(label.text).group("question") != "0"
+        and not any(
             other.page == label.page and abs(other.y - label.y) <= ROW_TOLERANCE and other.x < label.x
             for other in labels
         )
@@ -558,7 +1016,7 @@ def _step(last: str, by: int) -> str | None:
     return None
 
 
-def _entry_ids(labels: list[MSSpan]) -> list[tuple[str, int, str]]:
+def _entry_ids(labels: list[MSSpan], fresh: set[int] | None = None) -> list[tuple[str, int, str]]:
     """_entry_id for every label in reading order, correcting the typos where one label is
     printed twice in a row:
 
@@ -572,6 +1030,14 @@ def _entry_ids(labels: list[MSSpan]) -> list[tuple[str, int, str]]:
     ids = []
     for index, label in enumerate(labels):
         entry_id, question, path = _entry_id(label.text, ids[-1][1] if ids else 0)
+        # a row's later numbered piece, "1(a)(i)2" after "1(a)(i)1": the same row
+        # Likewise a lettered item inside a subpart, "6(a)(i)(a)" then "6(a)(i)(b)" (0580
+        # Paper 3/4: the question paper marks 6(a)(i) once, its (a) and (b) inside it).
+        groups = match_label(label.text).groupdict()
+        piece, item = groups.get("piece"), groups.get("item")
+        if ((piece and int(piece) > 1) or (item and item.lower() > "a")) and ids and ids[-1][0] == entry_id:
+            ids.append((entry_id, question, path))
+            continue
         # Real-paper finding #2 (0620/42 FM21): after 1(a)(v), rows labelled "1(v)(i)",
         # "1(v)(ii)", "1(v)(iii)" - the numerals vi, vii, viii split in two. When the two
         # pieces joined make the numeral after the previous row's, that's what it is.
@@ -590,7 +1056,8 @@ def _entry_ids(labels: list[MSSpan]) -> list[tuple[str, int, str]]:
                 path = f"{prev_head}.{joined}"
                 entry_id = f"{question}.{path}"
         same_page_repeat = (
-            ids and entry_id == ids[-1][0] and path and labels[index - 1].page == label.page
+            ids and entry_id == ids[-1][0] and path
+            and (labels[index - 1].page == label.page or index in (fresh or ()))
         )
         if same_page_repeat:
             *head, last = path.split(".")
@@ -627,6 +1094,11 @@ def _entry_ids(labels: list[MSSpan]) -> list[tuple[str, int, str]]:
 # worth 21) and never saw 21-40, so half the paper went unjoined and every part was left
 # with no marks. Every item on such a key is worth one mark.
 _KEY_ANSWER_RE = re.compile(r"^[A-E]$")
+_KEY_REMOVED_RE = re.compile(r"^question\s+(?:removed|discounted)$", re.IGNORECASE)
+_KEY_CELL_REACH = 9.0
+_KEY_CELL_WIDTH = 150.0  # number to its key: 54pt on 0455/12 ON16; the next column is 180pt on
+# what a withdrawn question's key row reads as: validate.is_removed_notice knows it
+REMOVED_KEY = "Question removed"
 ANSWER_KEY_MARKS = 1
 
 
@@ -650,13 +1122,60 @@ def _answer_key(spans: list[MSSpan]) -> list[tuple[int, str]] | None:
         nearest = min(right, key=lambda s: s.x, default=None)
         if nearest is not None and _KEY_ANSWER_RE.match(nearest.text):
             items.setdefault(int(span.text), nearest.text)
+            continue
+        # a withdrawn question: "Question" over "Removed" in its Key cell, the two lines
+        # centred on the number's row (0455/12 ON16 Q15; user-reported)
+        cell = [
+            s for s in spans
+            if s.page == span.page and abs(s.y - span.y) <= _KEY_CELL_REACH
+            and span.x < s.x < span.x + _KEY_CELL_WIDTH and not BARE_MARKS_RE.match(s.text)
+        ]
+        if _KEY_REMOVED_RE.match(" ".join(s.text.strip() for s in sorted(cell, key=lambda s: s.y))):
+            items.setdefault(int(span.text), REMOVED_KEY)
     return sorted(items.items()) or None
+
+
+_OVERTYPED_RE = re.compile(r"^\d{3}$")
+_OVERTYPED_REACH = 6.0  # the column's numbers are centred: 1-2 digits sit within 3pt of "113"'s centre
+
+
+def _overtyped_numbers(spans: list[MSSpan]) -> list[MSSpan]:
+    """A question number misprinted with a digit too many: "113" between "12" and "14" in
+    the Question column (0455/12 FM20; user-reported) is 13. Read as no label at all, its
+    row merged into 12's ("C 113 D", 12 worth 2) and 13 joined nothing. Taken only when
+    dropping one digit gives the number its column's neighbours leave out - k-1 the label
+    above, k+1 the one below, both centred with it - and k isn't printed there already."""
+    def centre(s: MSSpan) -> float:
+        return (s.bbox[0] + s.bbox[2]) / 2 if s.bbox[2] > s.bbox[0] else s.x
+
+    fixed = []
+    for span in spans:
+        text = span.text.strip()
+        if _OVERTYPED_RE.match(text):
+            column = [
+                s for s in spans
+                if s.page == span.page and s is not span and BARE_MARKS_RE.match(s.text.strip())
+                and abs(centre(s) - centre(span)) <= _OVERTYPED_REACH
+            ]
+            above = max((s for s in column if s.y < span.y), key=lambda s: s.y, default=None)
+            below = min((s for s in column if s.y > span.y), key=lambda s: s.y, default=None)
+            printed = {s.text.strip() for s in column}
+            for k in {text[1:], text[:2], text[0] + text[2]}:
+                if (
+                    not k.startswith("0") and k not in printed
+                    and above is not None and above.text.strip() == str(int(k) - 1)
+                    and below is not None and below.text.strip() == str(int(k) + 1)
+                ):
+                    span = span.model_copy(update={"text": k})
+                    break
+        fixed.append(span)
+    return fixed
 
 
 def parse_mark_scheme(pdf_path: object) -> list[MarkSchemeEntry]:
     doc = pymupdf.open(pdf_path)
     try:
-        all_spans = _join_split_labels(_rotated_spans(doc))
+        all_spans = _overtyped_numbers(_join_split_labels(_rotated_spans(doc, unbracket=True)))
         key = _answer_key(all_spans)
         if key is not None:
             return [
@@ -666,10 +1185,17 @@ def parse_mark_scheme(pdf_path: object) -> list[MarkSchemeEntry]:
                 )
                 for number, letter in key
             ]
+        if markscheme_paper.is_paper_layout(all_spans, doc):
+            return markscheme_paper.entries(doc, all_spans)
         spans, labels = _find_labels(all_spans)
+        partial_marks = _has_partial_marks_column(all_spans)
         codes = _codes_only(all_spans)
         # a column of codes has no numbers to place: any it'd find are answers' (cm², 14)
         marks_column_x = None if codes else _marks_column_x(labels, spans)
+        page_columns = {} if codes else _page_marks_columns(labels, spans, marks_column_x)
+
+        def column_x(page: int) -> float | None:
+            return None if marks_column_x is None else page_columns.get(page, marks_column_x)
         column_right = _marks_column_right(labels, spans, codes)
         # codes under one header don't share an edge ("A1" 18pt left of the "M1" above it,
         # 0625/32 ON25 6(d)), so a column of codes is read by its header where there is one
@@ -679,32 +1205,73 @@ def parse_mark_scheme(pdf_path: object) -> list[MarkSchemeEntry]:
         number_headers = {} if codes else _marks_headers(spans)
 
         entries = []
-        ids = _entry_ids(labels)
+        # a label reprinted at the top of the next page is its row carried over - with no mark
+        # beside it. With one, it's the next row misprinted: "2(c)(i)" again on 0610/62
+        # MJ17's last page, for 2(c)(ii)
+        fresh = {
+            i for i in range(1, len(labels))
+            if labels[i].text == labels[i - 1].text
+            and labels[i].page != labels[i - 1].page
+            and _has_marks_partner(labels[i].model_copy(update={"marks_below": False}), spans, codes)
+        }
+        ids = _entry_ids(labels, fresh)
+        # a row starts on its label's printed line, which can sit a point higher than the
+        # label: 0580/12 MJ16's "(0, –3)" at y 271 beside "16 (a)" at 272 went to 15(b)
+        # And a label centred in its cell starts its row at the first line's mark, up to
+        # _CENTRED_LABEL_LEAD higher: "19" at y 441, its "2" and "B1 for each" at 435 (0580/11
+        # MJ20) - that line went to Q18 and Q19 read no mark.
+        def line_of(label: MSSpan) -> tuple[int, float]:
+            lead = [
+                s.y for s in spans
+                if s.page == label.page
+                and label.y - _CENTRED_LABEL_LEAD <= s.y < label.y
+                and s.x > label.x
+                and (
+                    (column_x(s.page) is not None and MARKS_VALUE_RE.match(s.text)
+                     and abs(s.x - column_x(s.page)) <= MARKS_COLUMN_TOLERANCE)
+                    or _is_column_code(s, column_right)
+                )
+            ]
+            return (label.page, min([label.y, *lead]) - _SAME_LINE)
+
         for i, label in enumerate(labels):
-            end = labels[i + 1].position if i + 1 < len(labels) else None
+            end = line_of(labels[i + 1]) if i + 1 < len(labels) else None
             row_spans = sorted(
                 (
                     s
                     for s in spans
-                    if s.position >= label.position and (end is None or s.position < end)
+                    if (s.page, s.y) >= line_of(label) and (end is None or (s.page, s.y) < end)
                 ),
-                key=lambda s: s.position,
+                # a span just above the label's line is on it - a superscript, "K⁺" - and reads
+                # in its place, not first: "+ M2 potassium" hid 0620/52 MJ26's marking point
+                key=lambda s: (
+                    s.page,
+                    label.y if s.page == label.page and label.y - _SAME_LINE <= s.y < label.y else s.y,
+                    s.x,
+                ),
             )
 
             column_spans = [
                 s
                 for s in row_spans
                 if (
-                    marks_column_x is not None
+                    column_x(s.page) is not None
                     and MARKS_VALUE_RE.match(s.text)
                     and (
-                        abs(s.x - marks_column_x) <= MARKS_COLUMN_TOLERANCE
+                        abs(s.x - column_x(s.page)) <= MARKS_COLUMN_TOLERANCE
                         or _under_header(s, number_headers)
                     )
                 )
                 or (_is_row_code(s, headers) if s.page in headers else _is_column_code(s, column_right))
             ]
-            marks = _row_marks(column_spans)
+            # "Total: 21" set as two spans: the question's total, not this row's mark (0610/62
+            # MJ17 2(c)(iii) read 26)
+            totals = [t for t in row_spans if t.text.rstrip().lower().rstrip(":") == "total"]
+            column_spans = [
+                c for c in column_spans
+                if not any(t.page == c.page and abs(t.y - c.y) <= ROW_TOLERANCE and t.x < c.x for t in totals)
+            ]
+            marks = _row_marks(column_spans, partial_marks=partial_marks)
 
             excluded = {label.position} | {s.position for s in column_spans}
             answer_text = " ".join(
@@ -731,11 +1298,46 @@ def parse_mark_scheme(pdf_path: object) -> list[MarkSchemeEntry]:
                     answer_text=answer_text,
                     marks=marks,
                     printed_path=printed_path if printed_path != part_path else None,
+                    also_paths=[combined["also"]] if (combined := _COMBINED_PARTS_RE.match(label.text)) else [],
                 )
             )
+        _split_shared_marks(entries)
         return entries
     finally:
         doc.close()
+
+
+_ROW_CODE_RE = re.compile(r"\b(?:M|A|B|C)\d\b")
+
+
+def _split_shared_marks(entries: list[MarkSchemeEntry]) -> None:
+    """One Marks cell merged over several subparts' rows, its number printed beside the
+    first: 0620/42 ON18 2(b)(i) "M1 Same number of outer electrons" | 2, then 2(b)(ii) "M2
+    (Sr has) outer electrons are in the 5th shell" with a blank cell (user-reported - (i)
+    read 2, (ii) 0, against the QP's one [2] for both). Split by the rows' own marking
+    codes, one mark each, only where every row in the run has codes, the run shares a
+    parent part, and the codes add up to the mark printed."""
+    i = 0
+    while i < len(entries):
+        first = entries[i]
+        parent = first.part_path.rsplit(".", 1)[0] if "." in first.part_path else None
+        run = [first]
+        while (
+            parent is not None
+            and i + len(run) < len(entries)
+            and (nxt := entries[i + len(run)]).marks == 0
+            and nxt.question_number == first.question_number
+            and nxt.part_path.rsplit(".", 1)[0] == parent
+            and "." in nxt.part_path
+            and nxt.answer_text
+        ):
+            run.append(nxt)
+        if len(run) > 1 and first.marks > 0:
+            codes = [len(_ROW_CODE_RE.findall(e.answer_text)) for e in run]
+            if all(codes) and sum(codes) == first.marks:
+                for entry, n in zip(run, codes):
+                    entry.marks = n
+        i += len(run)
 
 
 # ---------------------------------------------------------------------------------------
@@ -969,11 +1571,14 @@ def parse_mark_scheme_layout(pdf_path: object) -> MSLayout:
     extracted text, which can't carry subscripts, bold mark codes or sketched answers."""
     doc = pymupdf.open(pdf_path)
     try:
-        all_spans = _join_split_labels(_rotated_spans(doc))
+        all_spans = _join_split_labels(_rotated_spans(doc, unbracket=True))
         if _answer_key(all_spans) is not None:
             # no rows to copy: a key's cells hold two items each, so composed schemes set
             # the letters from extracted text instead
             return MSLayout()
+        if markscheme_paper.is_paper_layout(all_spans, doc):
+            # no table: rows copied without a header or columns, portrait as printed
+            return MSLayout(rows=markscheme_paper.rows(doc), landscape=doc[0].rect.width > doc[0].rect.height)
         spans, labels = _find_labels(all_spans)
         if not labels:
             return MSLayout()

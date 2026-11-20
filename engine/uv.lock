@@ -786,6 +786,16 @@ wheels = [
 ]
 
 [[package]]
+name = "pymupdf-lite"
+version = "2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0d/a0/1827cdaafdfab76af9bae7a920b263aff703f8354bab0dd7c3ae9e97a3e6/pymupdf_lite-2.0.tar.gz", hash = "sha256:f0b34b790a2d1a3985adfff190173324d42b0e5aa876602f2c94bcbb16d8c6e2", size = 88809225, upload-time = "2026-10-26T16:43:36.932Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/88/ef/ab8e6bcf2fde19faa76e1a9b48151689bb582bf8cc971c468fe76d58c5fa/pymupdf_lite-2.0-cp311-abi3-macosx_10_15_x86_64.whl", hash = "sha256:65c318b6b73e96697aabcf0adb26206966559087dd74bb9992207c413d13ae1d", size = 24696486, upload-time = "2026-10-19T09:48:05.799Z" },
+    { url = "https://files.pythonhosted.org/packages/f1/49/d74571b68f23d50cfdd69babbac03358dfd0665cbf4a0c9403df51a40e33/pymupdf_lite-2.0-cp313-abi3-pyemscripten_2025_0_wasm32.whl", hash = "sha256:23539f86c9a85776cc5d3d83f952b7a64a6eadbe5d7005523aba9edfcc433913", size = 18428139, upload-time = "2026-10-19T09:51:03.134Z" },
+]
+
+[[package]]
 name = "pymupdf4llm"
 version = "2.0"
 source = { registry = "https://pypi.org/simple" }
@@ -964,7 +974,7 @@ wheels = [
 
 [[package]]
 name = "qbx"
-version = "0.1.0"
+version = "1.0.0"
 source = { virtual = "." }
 dependencies = [
     { name = "anthropic" },
@@ -972,7 +982,8 @@ dependencies = [
     { name = "fastapi" },
     { name = "keyring" },
     { name = "pydantic" },
-    { name = "pymupdf" },
+    { name = "pymupdf", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+    { name = "pymupdf-lite", marker = "platform_machine == 'x86_64' and sys_platform == 'darwin'" },
     { name = "python-multipart" },
     { name = "pywebview" },
     { name = "typer" },
@@ -993,7 +1004,8 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.141.1" },
     { name = "keyring", specifier = ">=25.7.0" },
     { name = "pydantic", specifier = ">=2.13.5" },
-    { name = "pymupdf", specifier = ">=2.0" },
+    { name = "pymupdf", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'", specifier = ">=2.0" },
+    { name = "pymupdf-lite", marker = "platform_machine == 'x86_64' and sys_platform == 'darwin'", specifier = ">=2.0" },
     { name = "python-multipart", specifier = ">=0.0.32" },
     { name = "pywebview", specifier = ">=6.2.1" },
     { name = "typer", specifier = ">=0.27.2" },

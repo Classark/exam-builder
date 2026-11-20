@@ -3,6 +3,8 @@
     qbx extract papers/9702_42_MJ_23_qp.pdf --ms papers/9702_42_MJ_23_ms.pdf --out ./out
     qbx calibrate papers/
     qbx tag-eval 0620
+    qbx audit                 # check every Cambridge paper in out/ against its PDF
+    qbx audit --save-baseline # freeze today's output; later runs report what changed
 """
 
 from collections import Counter
@@ -177,6 +179,99 @@ def tag_eval(
         if misses:
             for paper_key, key, want, got in r.misses:
                 typer.echo(f"    {paper_key} {key}: hand {want}, Claude {got}")
+
+
+@app.command()
+def audit(
+    out: Path = typer.Option(Path("./out"), help="Output directory of extracted papers"),
+    only: str = typer.Option("", help="Only papers whose key starts with this (e.g. 0620, 0620_41)"),
+    board: str = typer.Option("cambridge", help='Board to audit ("" for every board)'),
+    baseline: Path = typer.Option(None, help="Baseline file (default: <out>/.qbx-baseline.json)"),
+    save_baseline: bool = typer.Option(False, "--save-baseline", help="Save today's output as the baseline"),
+    report: Path = typer.Option(None, help="Also write every finding to this JSON file"),
+    workers: int = typer.Option(0, help="Papers checked at once (0: automatic)"),
+) -> None:
+    """Check extracted papers against their own PDFs - no person, no Claude.
+
+    Beyond the six validators: every line of question text is inside some region
+    (text_unclaimed, page_unclaimed), no two parts claim the same lines (overlap), parts
+    run in label order (order), each part's region holds its own label (label_outside)
+    and prints the marks the part carries (marks_in_region), and each paper looks like
+    other sittings of the same component (shape_*). With a baseline, it also lists every
+    paper whose questions, marks, scheme links or regions changed since - run it after
+    every parser change: a changed paper that was clean is a regression until shown not.
+    """
+    import json
+
+    from qbx.audit import audit_all, diff_snapshots, load_papers, save_baseline as write_baseline, shape_findings, snapshot
+    from qbx.scan import scan_workers
+
+    baseline = baseline or out / ".qbx-baseline.json"
+    results = audit_all(out, only, workers or scan_workers(), board)
+    papers = load_papers(out, only, board)
+    findings = [f for r in results for f in r.findings] + shape_findings(papers)
+    reports = {}
+    for paper in papers:
+        path = out / paper.paper_key / "report.json"
+        if path.is_file():
+            reports[paper.paper_key] = json.loads(path.read_text(encoding="utf-8"))
+
+    by_paper: dict[str, list] = {}
+    for f in findings:
+        by_paper.setdefault(f.paper_key, []).append(f)
+    for key in sorted(by_paper):
+        for f in by_paper[key]:
+            typer.echo(f.line())
+    errors = [r for r in results if r.error]
+    for r in errors:
+        typer.echo(f"{r.paper_key:<22} ERROR {r.error}")
+
+    # A paper is trusted when the six checks pass and nothing here fires.
+    validator_failed = {k for k, r in reports.items() if not r.get("passed", True)}
+    flagged = set(by_paper) | {r.paper_key for r in errors}
+    trusted = [p.paper_key for p in papers if p.paper_key not in flagged | validator_failed]
+    typer.echo("\nfindings by check:")
+    for check, count in Counter(f.check for f in findings).most_common():
+        papers_hit = len({f.paper_key for f in findings if f.check == check})
+        typer.echo(f"  {count:>5}  {check:<18} in {papers_hit} paper(s)")
+    typer.echo("\nby subject (trusted/total):")
+    subjects: dict[str, list[int]] = {}
+    for p in papers:
+        t = subjects.setdefault(p.paper_key[:4], [0, 0])
+        t[1] += 1
+        t[0] += p.paper_key in trusted
+    for subject, (ok, total) in sorted(subjects.items()):
+        typer.echo(f"  {subject}  {ok}/{total}")
+    typer.echo(
+        f"\n{len(trusted)}/{len(papers)} papers trusted "
+        f"({len(validator_failed)} fail the six checks, {len(flagged - validator_failed)} more flagged here)"
+    )
+
+    if baseline.is_file() and not save_baseline:
+        old = json.loads(baseline.read_text(encoding="utf-8"))
+        changed = 0
+        typer.echo(f"\nchanged since the baseline ({baseline}):")
+        for paper in papers:
+            if paper.paper_key not in old:
+                continue
+            lines = diff_snapshots(old[paper.paper_key], snapshot(paper))
+            if lines:
+                changed += 1
+                typer.echo(f"  {paper.paper_key}:")
+                for line in lines[:12]:
+                    typer.echo(f"      {line}")
+                if len(lines) > 12:
+                    typer.echo(f"      ... and {len(lines) - 12} more")
+        new = [p.paper_key for p in papers if p.paper_key not in old]
+        typer.echo(f"  {changed} paper(s) changed, {len(new)} new since the baseline")
+    if save_baseline:
+        write_baseline(papers, baseline)
+        typer.echo(f"\nbaseline saved: {len(papers)} paper(s) -> {baseline}")
+
+    if report:
+        report.write_text(json.dumps(
+            {"trusted": trusted, "findings": [f.__dict__ for f in findings],
+             "errors": {r.paper_key: r.error for r in errors}}, indent=1), encoding="utf-8")
 
 
 if __name__ == "__main__":

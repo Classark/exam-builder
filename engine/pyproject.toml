@@ -1,11 +1,16 @@
 [project]
 name = "qbx"
-version = "0.1.0"
+version = "1.0.0"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     # 2.0, not 1.28: 1.28's redaction rewrote "Td" as "TD", resetting the leading, so text
     # after a "T*" jumped lines in composed papers (0452/12 MJ26 Q2's table)
-    "pymupdf>=2.0",
+    "pymupdf>=2.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    # PyMuPDF 2.0 publishes no Intel Mac wheel, and its sdist builds "pymupdf-lite" - the
+    # same core, without the 4llm and layout add-ons (and their onnxruntime, which has no
+    # Intel Mac build at all). The engine uses neither; qbx/__init__.py sets the glyph
+    # correction itself, so both read text alike.
+    "pymupdf-lite>=2.0; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "pydantic>=2.13.5",
     "typer>=0.27.2",
     "fastapi>=0.141.1",
@@ -26,3 +31,4 @@ dev = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+

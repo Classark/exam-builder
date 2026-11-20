@@ -42,6 +42,12 @@ MAX_BACKTRACK = 4
 # newest paper in the pool), against a random 0-1 and 0.6 for a whole question
 RECENT_WEIGHT = 0.9
 RECENT_DECAY = 0.75
+# How much a level's distance from the one asked for counts against a question - more than
+# any one random draw (0-1), less than a whole question over a part (0.6) plus recency
+DIFFICULTY_WEIGHT = 1.2
+# Within this of the level asked for, a question is "at" it (unit levels are mark-weighted
+# averages: a Hard question can carry an Easy first part)
+NEAR_LEVEL = 0.75
 
 
 class ExamSource(BaseModel):
@@ -71,6 +77,10 @@ class ExamSpec(BaseModel):
     # The exam board every question comes from: an exam never mixes boards (their papers,
     # mark schemes and periodic tables differ). None: the board of `subject`.
     board: str | None = None
+    # The level the questions should be at, 1 Easy .. 4 Very hard (qbx/difficulty.py), or
+    # None for any. A preference after the total and the topics: questions within a level
+    # of it are tried first, and the rest only when they can't make the total.
+    difficulty: int | None = None
 
     def source_list(self) -> list[ExamSource]:
         if self.sources:
@@ -90,6 +100,8 @@ class _Unit:
     mcq: bool = False
     # answer clash ids of its parts: a unit sharing one with an already chosen unit is out
     clashes: frozenset[int] = frozenset()
+    # its parts' difficulty, weighted by their marks (1 Easy .. 4 Very hard)
+    difficulty: float = 2.0
 
 
 @dataclass
@@ -99,6 +111,18 @@ class ExamResult:
     exact: bool = False
     marks_by_topic: dict[str, int] = field(default_factory=dict)
     missing_topics: list[str] = field(default_factory=list)
+    # the chosen questions' difficulty, weighted by marks; None for an empty exam
+    difficulty: float | None = None
+
+
+def _difficulty_of(parts: list[dict]) -> float:
+    """Parts' difficulty weighted by their marks (a 6-mark Hard part outweighs a 1-mark
+    Easy one), from the library's part entries."""
+    levels = [(p.get("difficulty", 2), max(p.get("marks", 0), 0)) for p in parts]
+    weight = sum(m for _, m in levels)
+    if not weight:
+        return sum(d for d, _ in levels) / len(levels) if levels else 2.0
+    return sum(d * m for d, m in levels) / weight
 
 
 def _full_year(year: int) -> int:
@@ -195,7 +219,7 @@ def candidate_units(
                 if g:
                     by_question.append([_Unit(
                         paper_key, q["n"], all_paths, q["marks"], g, True, year, mcq,
-                        clashes_of(paper_key, q["n"], all_paths),
+                        clashes_of(paper_key, q["n"], all_paths), _difficulty_of(parts),
                     )])
                 continue
             matching = [p for p in parts if groups_of(p["topics"])]
@@ -210,7 +234,7 @@ def candidate_units(
                     options[key] = _Unit(
                         paper_key, q["n"], paths, sum(p["marks"] for p in chosen),
                         groups_of({t for p in chosen for t in p["topics"]}), paths == all_paths, year, mcq,
-                        clashes_of(paper_key, q["n"], paths),
+                        clashes_of(paper_key, q["n"], paths), _difficulty_of(chosen),
                     )
 
             add(_closure([p["path"] for p in matching], parts))
@@ -235,6 +259,16 @@ def candidate_units(
         else:
             pooled[group] = list(units)
             merged.append(pooled[group])
+    for units in pooled.values():
+        # one question, one level: copies of the same parts share their average, or a Core
+        # copy rated a level below its Extended twin would win every "easy" exam
+        same: dict[tuple[str, ...], list[_Unit]] = {}
+        for u in units:
+            same.setdefault(tuple(u.part_paths), []).append(u)
+        for copies in same.values():
+            level = sum(u.difficulty for u in copies) / len(copies)
+            for u in copies:
+                u.difficulty = level
     return merged, wanted
 
 
@@ -261,13 +295,23 @@ def _recency(year: int, newest: int) -> float:
     return RECENT_WEIGHT * RECENT_DECAY ** max(0, newest - year)
 
 
+def _closeness(u: _Unit, level: int | None) -> float:
+    """How much nearer the wanted level a unit is: 0 at it, -DIFFICULTY_WEIGHT a level off."""
+    return 0.0 if level is None else -DIFFICULTY_WEIGHT * abs(u.difficulty - level)
+
+
 def _attempt(
-    questions: list[list[_Unit]], n_groups: int, target: int, rng: random.Random, taken: frozenset[int] = frozenset()
+    questions: list[list[_Unit]], n_groups: int, target: int, rng: random.Random, taken: frozenset[int] = frozenset(),
+    level: int | None = None,
 ) -> list[_Unit]:
-    """`taken`: answer clash ids already used elsewhere in the exam."""
+    """`taken`: answer clash ids already used elsewhere in the exam. `level`: the
+    difficulty aimed at (ExamSpec.difficulty)."""
     newest = max((u.year for units in questions for u in units), default=0)
-    # a random order leaning newest-first - what the knapsack below looks through
-    weight = [rng.random() + _recency(max(u.year for u in units), newest) for units in questions]
+    # a random order leaning newest-first and nearest the level - what the knapsack looks through
+    weight = [
+        rng.random() + _recency(max(u.year for u in units), newest) + max(_closeness(u, level) for u in units)
+        for units in questions
+    ]
     order = sorted(range(len(questions)), key=lambda qi: -weight[qi])
     used: set[int] = set()
     chosen: list[tuple[int, _Unit]] = []
@@ -285,7 +329,7 @@ def _attempt(
             for u in questions[qi]:
                 if g not in u.groups or u.marks > remaining or u.clashes & blocked:
                     continue
-                score = rng.random() + (0.6 if u.whole else 0) + _recency(u.year, newest)
+                score = rng.random() + (0.6 if u.whole else 0) + _recency(u.year, newest) + _closeness(u, level)
                 if best_score is None or score > best_score:
                     best, best_score = (qi, u), score
         if best is None:
@@ -312,7 +356,7 @@ def _attempt(
 
 def _attempt_with_mcq(
     questions: list[list[_Unit]], n_groups: int, target: int, mcq_count: int, rng: random.Random,
-    taken: frozenset[int] = frozenset(),
+    taken: frozenset[int] = frozenset(), level: int | None = None,
 ) -> list[_Unit]:
     """`mcq_count` multiple-choice questions, then the rest of the marks from written ones.
 
@@ -328,15 +372,22 @@ def _attempt_with_mcq(
     written_qs = [units for units in written_qs if units]
     per_question = min((u.marks for units in mcq_qs for u in units), default=1) or 1
     mcq_target = min(mcq_count * per_question, target)
-    chosen_mcq = _attempt(mcq_qs, n_groups, mcq_target, rng, taken)[:mcq_count]
+    chosen_mcq = _attempt(mcq_qs, n_groups, mcq_target, rng, taken, level)[:mcq_count]
     written_target = target - sum(u.marks for u in chosen_mcq)
     taken = taken.union(*(u.clashes for u in chosen_mcq))
-    chosen_written = _attempt(written_qs, n_groups, written_target, rng, taken) if written_target > 0 else []
+    chosen_written = _attempt(written_qs, n_groups, written_target, rng, taken, level) if written_target > 0 else []
     return chosen_written + chosen_mcq
 
 
-def _score(units: list[_Unit], n_groups: int, target: int) -> float:
+def _average_difficulty(units: list[_Unit]) -> float | None:
+    marks = sum(u.marks for u in units)
+    return sum(u.difficulty * u.marks for u in units) / marks if marks else None
+
+
+def _score(units: list[_Unit], n_groups: int, target: int, level: int | None = None) -> float:
     total = sum(u.marks for u in units)
+    average = _average_difficulty(units)
+    off_level = abs(average - level) if level is not None and average is not None else 0.0
     by_group = [0] * n_groups
     for u in units:
         for g in u.groups:
@@ -346,7 +397,10 @@ def _score(units: list[_Unit], n_groups: int, target: int) -> float:
     missing = sum(1 for m in by_group if m == 0)
     fragments = sum(1 for u in units if not u.whole)
     same_paper = len(units) - len({u.paper_key for u in units})
-    return abs(target - total) * 100 + missing * 20 + imbalance * 10 + fragments * 1.5 + same_paper * 0.5
+    return (
+        abs(target - total) * 100 + missing * 20 + imbalance * 10 + off_level * 12
+        + fragments * 1.5 + same_paper * 0.5
+    )
 
 
 def build_exam(
@@ -368,20 +422,36 @@ def build_exam(
     n_groups = max(len(wanted), 1)
     covered = set().union(*(u.groups for units in questions for u in units)) if questions else set()
     missing = [spec.topic_ids[i] for i in range(len(wanted)) if i not in covered]
+    level = spec.difficulty if spec.difficulty in (1, 2, 3, 4) else None
 
-    best, best_score = [], None
-    for i in range(ATTEMPTS):
-        rng = random.Random(spec.seed * 7919 + i)
-        if counted:
-            units = _attempt_with_mcq(questions, n_groups, spec.total_marks, spec.mcq_count, rng, taken)
-        else:
-            units = _attempt(questions, n_groups, spec.total_marks, rng, taken)
-        score = _score(units, n_groups, spec.total_marks)
-        if counted:
-            # the number of multiple-choice questions asked for outweighs everything but the total
-            score += abs(sum(1 for u in units if u.mcq) - spec.mcq_count) * 50
-        if best_score is None or score < best_score:
-            best, best_score = units, score
+    def search(pool: list[list[_Unit]]) -> tuple[list[_Unit], float | None]:
+        best, best_score = [], None
+        for i in range(ATTEMPTS):
+            rng = random.Random(spec.seed * 7919 + i)
+            if counted:
+                units = _attempt_with_mcq(pool, n_groups, spec.total_marks, spec.mcq_count, rng, taken, level)
+            else:
+                units = _attempt(pool, n_groups, spec.total_marks, rng, taken, level)
+            score = _score(units, n_groups, spec.total_marks, level)
+            if counted:
+                # the number of multiple-choice questions asked for outweighs everything but the total
+                score += abs(sum(1 for u in units if u.mcq) - spec.mcq_count) * 50
+            if best_score is None or score < best_score:
+                best, best_score = units, score
+        return best, best_score
+
+    if level is None:
+        best, _ = search(questions)
+    else:
+        # questions near the level first; the whole pool only if that makes a better exam -
+        # the total and the topics come before the level
+        near = [[u for u in units if abs(u.difficulty - level) <= NEAR_LEVEL] for units in questions]
+        best, best_score = search([units for units in near if units])
+        reached = set().union(*(u.groups for u in best)) if best else set()
+        if sum(u.marks for u in best) != spec.total_marks or not covered <= reached:
+            wide, wide_score = search(questions)
+            if best_score is None or wide_score < best_score:
+                best = wide
 
     # grouped by topic as asked, then oldest paper first within a topic
     best.sort(key=lambda u: (min(u.groups) if u.groups else 0, u.year, u.paper_key, u.question_number))
@@ -395,6 +465,7 @@ def build_exam(
         exact=total == spec.total_marks,
         marks_by_topic=by_topic,
         missing_topics=missing,
+        difficulty=_average_difficulty(best),
     )
 
 

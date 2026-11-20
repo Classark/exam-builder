@@ -1209,3 +1209,72 @@ def test_a_question_whose_source_pdf_has_gone_prints_a_placeholder_not_an_error(
     doc.close()
     assert "moved_away.pdf) is missing from the papers folder" in text
     assert "Question content goes here." in text  # the other question still prints
+
+
+def test_a_later_subpart_gets_its_containers_letter_when_the_container_has_no_line(tmp_path):
+    # 0620/33 MJ26 Q4: "(a) (i) Predict..." on one line; a booklet using only (a)(iv)
+    # printed it as a bare "(i)"
+    from qbx.quiz_export import QuizGroup, _resolve_group
+    from qbx.schema import BBox, ContainerHeading, LabelRef, Paper, Question, QuestionPart
+
+    def ref(x, y):
+        return LabelRef(page=0, x0=x, y0=y, x1=x + 14, y1=y + 11, size=11, bold=True, origin_x=x, origin_y=y + 9)
+
+    def part(path, y, x):
+        return QuestionPart(question_id="4", id=f"4.{path}", path=path, depth=2, text="", image_path="", marks=1,
+                            segments=[BBox(page=0, x0=x - 4, y0=y, x1=550, y1=y + 40)], label_bbox=ref(x, y))
+
+    question = Question(paper_key="k", board="Cambridge", subject="0620", question_number=4, stem_text="",
+                        stem_image_path="", total_marks=2,
+                        stem_segments=[BBox(page=0, x0=45, y0=60, x1=550, y1=290)],
+                        container_headings=[ContainerHeading(path="a", text="(a) (i)", label_bbox=ref(72, 300))],
+                        parts=[part("a.i", 300, 72), part("a.iv", 460, 90)])
+    paper = Paper(paper_key="k", board="Cambridge", level="", subject="0620", paper="3", variant="3",
+                  session="MJ", year=2026, questions=[question])
+    (tmp_path / "k").mkdir()
+    (tmp_path / "k" / "paper.json").write_text(paper.model_dump_json(), encoding="utf-8")
+
+    later = _resolve_group(QuizGroup("k", 4, ["a.iv"]), tmp_path, {}, 1)
+    at, text = later.blocks[-1].container_label
+    assert text == "(a)" and at.x0 == 72 and at.y0 == 460
+    first = _resolve_group(QuizGroup("k", 4, ["a.i"]), tmp_path, {}, 1)
+    assert first.blocks[-1].container_label is None  # its own line already holds "(a)"
+
+
+def test_one_stray_crop_does_not_move_every_question_in_a_paper():
+    # 0620/11 MJ16 Q13's crop ran to x 0; a booklet's shared margin followed it, and every
+    # other question moved 40pt right and shrank
+    from qbx.quiz_export import MARGIN, PAGE_WIDTH, _Block, _Layout
+    from qbx.schema import BBox
+
+    def question(x0, x1):
+        return [_Block(segments=[BBox(page=0, x0=x0, y0=60, x1=x1, y1=200)])]
+
+    typical = [question(46, 550) for _ in range(9)]
+    stray = question(0, 550)
+    layout = _Layout.shared(typical + [stray])
+    assert layout.min_x0 == 46
+    assert abs(layout.origin_x - MARGIN) < 6  # the typical question sits at the margin
+    assert layout.fitted(typical[0]) is layout
+    own = layout.fitted(stray)  # the stray one fits itself, still on the page
+    assert own.origin_x >= 0 and own.origin_x + 550 * own.scale <= PAGE_WIDTH
+
+
+def test_a_clipped_drawing_counts_only_where_it_shows():
+    # hatching drawn as long lines clipped to a stopper's square (0620/11 MJ16 Q13)
+    import pymupdf
+    from qbx.crops import _visible_drawings
+
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((60, 60), "x")
+    shape = page.new_shape()
+    shape.draw_line((-30, 200), (200, 120))
+    shape.finish(color=(0, 0, 0), width=0.5)
+    shape.commit()
+    # wrap the line in a clip to x 100-120, y 140-180 (PDF space counts y up)
+    xref = page.get_contents()[-1]
+    body = doc.xref_stream(xref)
+    doc.update_stream(xref, b"q 100 662 20 40 re W n " + body + b" Q")
+    drawn = [d for d in _visible_drawings(page) if d.get("color")]
+    assert drawn and min(d["rect"].x0 for d in drawn) >= 99

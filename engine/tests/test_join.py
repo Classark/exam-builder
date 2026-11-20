@@ -178,3 +178,24 @@ def test_paper_and_scheme_cutting_a_question_differently_are_aligned_by_marks():
     rows[2].marks = 3
     joins = join_parts_to_mark_scheme([_question(6, [a, b])], rows)
     assert (b.id, rows[2].id) not in {(j.part_id, j.mark_scheme_entry_id) for j in joins}
+
+
+def test_marking_points_labelled_as_subparts_join_by_their_numbering():
+    # 0620/51 MJ26 Q2: 2(a)(i)'s points printed as rows "2(a)" M1, "2(a)(i)" M2, and
+    # 2(a)(ii)'s as "2(a)(ii)", "(iii)", "(iv)" M1-M3
+    from qbx.join import join_parts_to_mark_scheme
+    from qbx.schema import MarkSchemeEntry, Question, QuestionPart
+
+    parts = [
+        QuestionPart(question_id="2", path=p, depth=2, text="", image_path="", marks=m, id=f"2.{p}")
+        for p, m in (("a.i", 2), ("a.ii", 3), ("b", 1))
+    ]
+    question = Question(paper_key="k", board="", subject="", question_number=2, stem_text="", stem_image_path="",
+                        total_marks=6, parts=parts)
+    rows = [("a", "M1 green"), ("a.i", "M2 remains"), ("a.ii", "M1 brown"), ("a.iii", "M2 fizz"),
+            ("a.iv", "M3 relights"), ("b", "white precipitate")]
+    entries = [MarkSchemeEntry(id=f"2.{p}", paper_key="k", question_number=2, part_path=p, answer_text=t, marks=1)
+               for p, t in rows]
+    joins = {(j.part_id, j.mark_scheme_entry_id) for j in join_parts_to_mark_scheme([question], entries)}
+    assert joins == {("2.a.i", "2.a"), ("2.a.i", "2.a.i"), ("2.a.ii", "2.a.ii"), ("2.a.ii", "2.a.iii"),
+                     ("2.a.ii", "2.a.iv"), ("2.b", "2.b")}

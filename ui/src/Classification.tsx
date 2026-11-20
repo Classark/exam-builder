@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { AlertTriangle, Download, Layers, Loader2 } from 'lucide-react'
-import { api } from './api'
+import { AlertTriangle, Download, Eye, Layers, Loader2, X } from 'lucide-react'
+import { api, errorMessage } from './api'
+import { PagePreview } from './PagePreview'
+import { runSave } from './Saving'
 import { Select } from './Select'
 import { useSourcePicker, type PickedSources } from './SourcePicker'
-import type { ClassifiedPreview, ClassifiedRequest, ClassifiedState, ClassifiedTopic, Topic } from './types'
+import { useLive } from './live'
+import type { ClassifiedItem, ClassifiedPreview, ClassifiedRequest, ClassifiedState, ClassifiedTopic, Topic } from './types'
 
 /** Classification mode: classified (topical) past-paper booklets. Every past question on a
  * topic, gathered into a question booklet and mark scheme per topic, from the topic tags the
@@ -49,16 +52,6 @@ function remember(value: Remembered) {
   }
 }
 
-/** Downloads a URL the way clicking a link to it would. */
-function downloadUrl(url: string) {
-  const link = document.createElement('a')
-  link.href = url
-  link.download = ''
-  document.body.appendChild(link)
-  link.click()
-  link.remove()
-}
-
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
 const year = (text: string) => (/^\d{4}$/.test(text.trim()) ? Number(text.trim()) : null)
 const itemKey = (topicId: string, paperKey: string, n: number) => `${topicId}|${paperKey}|${n}`
@@ -96,6 +89,10 @@ export function Classification() {
   const [error, setError] = useState<string | null>(null)
   const [excluded, setExcluded] = useState<Set<string>>(new Set())
   const startedId = useRef<number | null>(null)
+  // tagging from here (user-asked: a release build has no Settings to start it from); the
+  // preview re-reads as tags arrive (`version` moves with each paper tagged)
+  const { tagging, startTagging, ai, version } = useLive()
+  const [tagError, setTagError] = useState('')
 
   // the topic list of the first subject picked - the one topics are chosen from
   useEffect(() => {
@@ -160,14 +157,14 @@ export function Classification() {
           setPreview(p)
           setError(null)
         })
-        .catch((e: Error) => live && setError(e.message))
+        .catch((e: unknown) => live && setError(errorMessage(e)))
         .finally(() => live && setLoading(false))
     }, PREVIEW_DEBOUNCE_MS)
     return () => {
       live = false
       window.clearTimeout(timer)
     }
-  }, [request])
+  }, [request, version])
 
   // a run already going (started before switching here) shows its progress
   useEffect(() => {
@@ -188,13 +185,23 @@ export function Classification() {
           setJob(next)
           if (!next.running && next.ready && next.id !== undefined && next.id === startedId.current) {
             startedId.current = null
-            downloadUrl(api.classifiedDownloadUrl(next.id))
+            void runSave(() => api.saveClassified(next.id!))
           }
         })
         .catch(() => setJob({ ...job })) // backend busy: try again
     }, POLL_MS)
     return () => window.clearTimeout(timer)
   }, [job])
+
+  // the question shown on the right as it will print, and its number in its booklet
+  const [shown, setShown] = useState<{ key: string; item: ClassifiedItem; number: number } | null>(null)
+  const show = (t: ClassifiedTopic, item: ClassifiedItem) => {
+    const key = itemKey(t.topic_id, item.paper_key, item.question_number)
+    // booklets number written questions from 1, then multiple choice from 1 again
+    const same = included(t).filter((i) => i.mcq === item.mcq)
+    const at = same.findIndex((i) => i.paper_key === item.paper_key && i.question_number === item.question_number)
+    setShown(shown?.key === key ? null : { key, item, number: at >= 0 ? at + 1 : 1 })
+  }
 
   const included = (t: ClassifiedTopic) => t.items.filter((i) => !excluded.has(itemKey(t.topic_id, i.paper_key, i.question_number)))
   const toMake = (preview?.topics ?? []).filter((t) => included(t).length > 0)
@@ -212,7 +219,7 @@ export function Classification() {
       startedId.current = state.id ?? null
       setJob(state)
     } catch (e) {
-      setError((e as Error).message)
+      setError(errorMessage(e))
     }
   }
 
@@ -337,9 +344,9 @@ export function Classification() {
             className="btn-primary px-3 py-1.5 text-sm"
             disabled={making || toMake.length === 0}
             onClick={() => void makeBooklets()}
-            title="A zip of each topic's question booklet and mark scheme"
+            title="Saves each topic's question booklet and mark scheme into Topic booklets in your save folder"
           >
-            <Download size={15} /> Download
+            <Download size={15} /> Save booklets
           </button>
         </header>
 
@@ -366,12 +373,31 @@ export function Classification() {
             <p className="rounded-lg bg-danger-wash px-3 py-2 text-xs text-danger">{error || job?.error}</p>
           )}
           {preview && preview.untagged_parts > 0 && (
-            <p className="flex items-start gap-2 rounded-lg bg-warning-wash px-3 py-2 text-xs text-warning">
-              <AlertTriangle size={14} className="mt-px shrink-0" />
-              <span>
+            <p className="flex items-center gap-3 rounded-lg bg-warning-wash px-3 py-2 text-xs text-warning">
+              <AlertTriangle size={14} className="shrink-0" />
+              <span className="flex-1">
                 {preview.untagged_parts} of {preview.n_parts} parts in these papers have no topic tags, so they
-                can't be put under a topic. Tag them from Settings to include them.
+                can't be put under a topic.{' '}
+                {tagging.running
+                  ? `Claude is tagging them now${tagging.total ? ` (${tagging.done ?? 0} of ${tagging.total})` : ''} - this list updates as it goes.`
+                  : tagging.paused
+                    ? tagging.paused
+                    : ai
+                      ? 'Claude can tag them by topic.'
+                      : 'Sign in to your Classark account to have Claude tag them.'}
+                {tagError && <span className="mt-1 block text-danger">{tagError}</span>}
               </span>
+              {ai && !tagging.running && (
+                <button
+                  className="btn-primary shrink-0 px-3 py-1 text-xs"
+                  onClick={() => {
+                    setTagError('')
+                    startTagging().catch((e: unknown) => setTagError(errorMessage(e)))
+                  }}
+                >
+                  {tagging.paused ? 'Tag the rest' : 'Tag them now'}
+                </button>
+              )}
             </p>
           )}
           {!preview?.topics.length && !error && (
@@ -404,7 +430,9 @@ export function Classification() {
                       const key = itemKey(t.topic_id, i.paper_key, i.question_number)
                       return (
                         <li key={key}>
-                          <label className="flex cursor-pointer items-start gap-3 px-4 py-1.5 text-sm hover:bg-hover">
+                          <div
+                            className={`flex items-start gap-3 px-4 py-1.5 text-sm hover:bg-hover ${shown?.key === key ? 'bg-accent-wash' : ''}`}
+                          >
                             <input
                               type="checkbox"
                               className="mt-1 size-3.5 shrink-0 accent-[var(--accent)]"
@@ -413,7 +441,12 @@ export function Classification() {
                               onChange={() => toggleItem(key)}
                               aria-label={`Include ${i.paper} ${i.sitting} question ${i.question_number}`}
                             />
-                            <span className={`min-w-0 flex-1 ${excluded.has(key) ? 'text-faint line-through' : ''}`}>
+                            <button
+                              type="button"
+                              onClick={() => show(t, i)}
+                              title="Preview this question as it will print"
+                              className={`min-w-0 flex-1 cursor-pointer text-left ${excluded.has(key) ? 'text-faint line-through' : ''}`}
+                            >
                               <span className="font-medium">{i.paper}</span>{' '}
                               <span className="text-ink-2">{i.sitting}</span> · Q{i.question_number}
                               {i.parts !== 'All' && <span className="text-ink-2"> {i.parts}</span>}
@@ -421,9 +454,10 @@ export function Classification() {
                               {i.also_in.length > 0 && (
                                 <span className="block text-xs text-muted">Also in {i.also_in.join(', ')}</span>
                               )}
-                            </span>
+                            </button>
                             <span className="shrink-0 text-xs text-muted">{plural(i.marks, 'mark')}</span>
-                          </label>
+                            <Eye size={14} className={`mt-0.5 shrink-0 ${shown?.key === key ? 'text-accent' : 'text-faint'}`} />
+                          </div>
                         </li>
                       )
                     })}
@@ -434,6 +468,33 @@ export function Classification() {
           })}
         </div>
       </section>
+
+      {/* ── The question picked, as it will print ── */}
+      {shown && (
+        <aside className="card flex w-[440px] shrink-0 flex-col overflow-hidden">
+          <header className="flex items-center gap-2 border-b border-line px-4 py-3">
+            <Eye size={16} className="shrink-0 text-accent" />
+            <h2 className="min-w-0 flex-1 truncate font-semibold">
+              {shown.item.paper} {shown.item.sitting} · Q{shown.item.question_number}
+            </h2>
+            <button className="btn-ghost p-1" aria-label="Close preview" onClick={() => setShown(null)}>
+              <X size={15} />
+            </button>
+          </header>
+          <div className="scroll-quiet min-h-0 flex-1 overflow-auto bg-sunken p-4">
+            <PagePreview
+              request={{
+                items: [
+                  { paper_key: shown.item.paper_key, question_number: shown.item.question_number, part_paths: shown.item.part_paths },
+                ],
+                cover: false,
+                first_number: shown.number,
+              }}
+              empty=""
+            />
+          </div>
+        </aside>
+      )}
     </div>
   )
 }

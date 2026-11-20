@@ -127,3 +127,30 @@ def test_multiple_choice_questions_on_the_copyright_page_are_kept():
         "Permission to reproduce items where third-party owned material protected by copyright"
     )
     assert classify_page(text, page_number=16, page_count=16) == PageType.QUESTION
+
+
+def test_an_erratum_notice_bound_into_the_paper_is_skipped():
+    # 0625/32 FM19 (user-reported): after the cover, with no footer code - read as the first
+    # question page, the paper code was looked for there and the paper couldn't be extracted
+    text = (
+        "Cambridge Assessment International Education\nPHYSICS\n0625/32\nPaper 3 Theory (Core)\n"
+        "February/March 2019\nERRATUM NOTICE\nTO BE OPENED ON THE DAY OF THE EXAMINATION\n"
+        "Turn to page 9.\nQuestion 6(a) reads:\nFig. 6.1 shows a cross-section of the oven.\n"
+        "Question 6(a) should read:\nFig. 6.1 is a diagram of the inside of an electric oven.\n"
+    )
+    assert classify_page(text, 2, 17) == PageType.INSERT
+    # a question page that happens to say "erratum" keeps its questions
+    assert classify_page("6 (a) Erratum: see the notice.\nExplain why. [2]\n", 9, 17) == PageType.QUESTION
+
+
+def test_empty_pages_are_pages_with_nothing_drawn():
+    # regression (0452/11 ON16): a damaged download whose question pages are white
+    import pymupdf
+
+    from qbx.pages import empty_pages
+
+    doc = pymupdf.open()
+    doc.new_page().insert_text((72, 72), "BLANK PAGE")
+    doc.new_page()  # nothing at all
+    doc.new_page().draw_rect(pymupdf.Rect(100, 100, 300, 300), color=(0, 0, 0), width=2)
+    assert empty_pages(doc) == [1]

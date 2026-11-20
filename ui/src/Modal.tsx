@@ -7,11 +7,14 @@ export function Modal({
   onClose,
   children,
   width = 'max-w-lg',
+  dismissable = true,
 }: {
   title: string
   onClose: () => void
   children: ReactNode
   width?: string
+  // false: no close button, and Escape or a click outside does nothing (a choice is required)
+  dismissable?: boolean
 }) {
   const card = useRef<HTMLDivElement>(null)
   // Callers pass `onClose` inline, so it's a new function on every render. The effect below
@@ -20,7 +23,7 @@ export function Modal({
   // every few seconds, which kept pulling the cursor out of a field mid-word.
   const closeRef = useRef(onClose)
   useLayoutEffect(() => {
-    closeRef.current = onClose
+    closeRef.current = dismissable ? onClose : () => {}
   })
 
   useEffect(() => {
@@ -38,7 +41,7 @@ export function Modal({
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-[var(--surface-overlay)] p-4 backdrop-blur-[4px]"
-      onMouseDown={(e) => e.target === e.currentTarget && onClose()}
+      onMouseDown={(e) => dismissable && e.target === e.currentTarget && onClose()}
     >
       <div
         ref={card}
@@ -46,13 +49,15 @@ export function Modal({
         role="dialog"
         aria-modal="true"
         aria-label={title}
-        className={`card w-full ${width} max-h-[85vh] overflow-hidden shadow-modal outline-none`}
+        className={`card w-full ${width} max-h-[85vh] overflow-hidden whitespace-normal shadow-modal outline-none`}
       >
         <div className="flex items-center justify-between border-b border-line px-6 py-4">
           <h2 className="text-lg font-semibold">{title}</h2>
-          <button onClick={onClose} className="btn-ghost -mr-2" aria-label="Close">
-            <X size={18} />
-          </button>
+          {dismissable && (
+            <button onClick={onClose} className="btn-ghost -mr-2" aria-label="Close">
+              <X size={18} />
+            </button>
+          )}
         </div>
         <div className="scroll-quiet max-h-[calc(85vh-4rem)] overflow-auto px-6 py-5">{children}</div>
       </div>

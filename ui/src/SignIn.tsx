@@ -6,7 +6,7 @@ import type { AccountState } from './types'
 
 /** Signing in to a Classark account (engine/qbx/account.py): the browser opens
  * classark.com, the teacher signs in there, and the app hears back on its own. */
-export function SignInPanel({ account, onSkip, onAbout }: { account: AccountState; onSkip?: () => void; onAbout: () => void }) {
+export function SignInPanel({ account }: { account: AccountState }) {
   const { poke } = useLive()
   const [busy, setBusy] = useState(false)
   const waiting = account.status === 'waiting'
@@ -63,28 +63,15 @@ export function SignInPanel({ account, onSkip, onAbout }: { account: AccountStat
             <ExternalLink size={14} />
             No subscription yet? See Classark Exam Builder plans
           </button>
-          {onSkip && (
-            <button className="text-xs text-muted underline" onClick={onSkip}>
-              Continue without signing in (no Claude features)
-            </button>
-          )}
         </div>
       )}
-
-      <p className="mt-10 text-[11px] leading-relaxed text-faint">
-        Classark Exam Builder is free software, licensed under the GNU Affero General Public License v3.0, and comes
-        with no warranty. Its complete source code is included.{' '}
-        <button className="underline" onClick={onAbout}>
-          About &amp; licences
-        </button>
-      </p>
     </div>
   )
 }
 
 /** The whole window, before anything else: what a release build shows until the teacher
- * signs in or chooses to carry on without an account. */
-export function SignInScreen(props: { account: AccountState; onSkip: () => void; onAbout: () => void }) {
+ * signs in (user-decided: no carrying on without an account). */
+export function SignInScreen(props: { account: AccountState }) {
   return (
     <div className="flex min-h-0 flex-1 items-center justify-center overflow-auto bg-page p-6">
       <SignInPanel {...props} />

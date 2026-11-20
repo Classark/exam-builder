@@ -9,6 +9,7 @@ import datetime
 from pydantic import BaseModel
 
 from qbx.exam_builder import ExamSpec
+from qbx import difficulty
 from qbx.llm import LLM
 from qbx.topics import Topic, topics_prompt_list
 
@@ -27,6 +28,8 @@ class _RequestReply(BaseModel):
     question_style: str = "structured"
     # a set number of multiple-choice questions, when the request gives one; else 0
     mcq_count: int = 0
+    # "easy", "medium", "hard", "very hard" (qbx/difficulty.py), or "" for any
+    difficulty: str = ""
     name: str = ""
     # topics asked for that match nothing in the list, in the request's own words
     unmatched: list[str] = []
@@ -69,6 +72,8 @@ def build_prompt(text: str, subjects: list[dict], topics_by_subject: dict[str, l
         "- mcq_count: how many multiple-choice questions, if the request gives a number of them "
         "('only 4 multiple choice', '5 MCQs and the rest written') - question_style is then 'any'. "
         "0 if no number is given;",
+        "- difficulty: 'easy', 'medium', 'hard' or 'very hard' if the request asks for a level "
+        "('a hard exam', 'challenging questions for top students', 'easy revision'), else '';",
         "- name: a short title for the exam, e.g. 'Electrolysis and rates of reaction'.",
     ]
     return "\n".join(lines)
@@ -96,6 +101,7 @@ def read_request(
         papers=[p.strip() for p in reply.papers if p.strip()],
         question_style=style,
         mcq_count=mcq_count,
+        difficulty=difficulty.parse(reply.difficulty),
         seed=seed,
     )
     name = " ".join(reply.name.split())[:60] or "Exam"

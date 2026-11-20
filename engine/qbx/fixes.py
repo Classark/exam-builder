@@ -1,16 +1,18 @@
 """Corrections to an extracted paper, kept as a list of small operations.
 
-Every change to a paper after extraction - a teacher's edit in the Reviewer or a fix Claude
-proposed (qbx/ai_fix.py) - is one `Fix` in `out/<paper>/fixes.json`. The extraction as the
+Every change to a paper after extraction - a teacher's edit in the Reviewer - is one `Fix`
+in `out/<paper>/fixes.json`. The extraction as the
 parser left it is kept in `paper.base.json`; the paper the app uses is always that base,
 plus the hand-drawn mark scheme links (qbx/ms_links.py), plus every applied fix in order
 (`rebuild`). So a fix survives "Re-process papers with issues", and any one can be undone.
 
 A fix is only ever one of the operations below - none of them invents question or mark
-scheme content, they move, join and number what the parser found. A fix proposed by Claude
-is tried on a copy first and the six checks run again (`verify`); in Auto mode it is applied
-only when it clears the issues it was meant for and raises none (CLAUDE.md: the LLM is a
-validator, never the extractor - here the validators decide what Claude may change).
+scheme content, they move, join and number what the parser found.
+
+Claude used to propose fixes too (source "ai"). It no longer fixes papers (user-decided: the
+Reviewer made hand fixes quick, and a Claude patch hid the parser bug instead of getting it
+fixed for every paper like it), so fixes.json files that still hold its fixes are read but
+those fixes are never applied.
 """
 
 import functools
@@ -22,7 +24,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from qbx.schema import BBox, Paper, QuestionPart, QuestionPartMarkScheme
+from qbx.schema import BBox, Paper, Question, QuestionPart, QuestionPartMarkScheme
 from qbx.validate import validate_paper
 
 FIXES_FILE = "fixes.json"
@@ -46,12 +48,17 @@ Op = Literal[
     "set_cover_total",  # value - the cover's total misread
     "renumber_question",  # question_number -> value
     "delete_question",  # question_number - something read as a question that isn't one
+    "withdraw_question",  # question_number - the board withdrew it ("Question removed"), and the
+                      # parser didn't see the notice: dropped with its scheme rows, and listed in
+                      # `withdrawn` so the cover and numbering checks allow for it (user-asked)
+    "add_question",   # question_number, value (marks), fields {text, segments}: a question
+                      # the parser missed, drawn by hand in the Reviewer - one unlettered part.
     "link_region",    # part_id, at {page, y0, y1}: the part's answer is that stretch of the
                       # mark scheme - a row the parser lost or filed elsewhere. Built like a
-                      # teacher's drawn link (qbx/ms_links.py), never written by Claude
+                      # teacher's drawn link (qbx/ms_links.py)
     "dismiss",        # the paper itself disagrees (Pearson's/Cambridge's own error): marks
                       # the issues checked, changes nothing
-    "needs_person",   # Claude can't fix it from the text: a note on the issues, no change
+    "needs_person",   # a note on the issues, no change (Claude's, from when it fixed papers)
 ]
 # operations that change nothing in the paper
 NOTES = {"dismiss", "needs_person"}
@@ -75,16 +82,12 @@ class Fix(BaseModel):
     issues: list[str] = []  # the issue keys it's meant to clear
     reason: str = ""
     source: Literal["ai", "manual"] = "manual"
-    # the model that suggested it ("" before this was kept): a fresh "Fix all" re-asks
-    # about a suggestion an earlier, different model made
+    # Claude's fixes only: which model and fixer version made them - kept so old files load
     model: str = ""
-    # the version of the fixer itself (ai_fix.FIXER_VERSION) - what Claude was shown and could
-    # do: a suggestion an older one made is asked again by "Fix all"
     fixer: int = 0
-    # applied: part of the paper; suggested: waiting for the teacher; rejected / undone:
-    # kept for the record (and so Claude isn't asked the same thing again)
+    # applied: part of the paper; undone: kept for the record ("suggested" and "rejected"
+    # were Claude's suggestions)
     status: Literal["applied", "suggested", "rejected", "undone"] = "applied"
-    # what trying it found: issues it clears, issues it would raise
     clears: list[str] = []
     raises: list[str] = []
     created_at: float = 0.0
@@ -244,8 +247,18 @@ def apply_step(paper: Paper, step: Step) -> None:
         gone = {p.id for p in question.parts}
         paper.questions = [q for q in paper.questions if q is not question]
         paper.joins = [j for j in paper.joins if j.part_id not in gone]
+    elif step.op == "withdraw_question":
+        question = _question(paper, step.question_number)
+        gone = {p.id for p in question.parts}
+        paper.questions = [q for q in paper.questions if q is not question]
+        paper.joins = [j for j in paper.joins if j.part_id not in gone]
+        paper.mark_scheme = [e for e in paper.mark_scheme if e.question_number != question.question_number]
+        if str(question.question_number) not in paper.withdrawn:
+            paper.withdrawn = [*paper.withdrawn, str(question.question_number)]
     elif step.op == "link_region":
         _link_region(paper, step)
+    elif step.op == "add_question":
+        _add_question(paper, step)
     else:  # pragma: no cover - Literal keeps this out
         raise FixError(f"unknown operation {step.op}")
 
@@ -403,6 +416,34 @@ def _add(paper: Paper, step: Step) -> None:
     question.parts.insert(index, part)
 
 
+def _add_question(paper: Paper, step: Step) -> None:
+    """A question the parser never found (its number unreadable, or run into the question
+    before), drawn by hand: one unlettered part holding the drawn region, sorted into place.
+    Its mark scheme rows are then linked like any part's."""
+    number = step.question_number
+    if number is None or number < 1:
+        raise FixError("add_question needs a question number")
+    if any(q.question_number == number for q in paper.questions):
+        raise FixError(f"question {number} is already on the paper")
+    segments = [BBox(**s) if isinstance(s, dict) else s for s in step.fields.get("segments", [])]
+    if not segments:
+        raise FixError("add_question needs the question's region")
+    marks = step.value or 0
+    first = paper.questions[0] if paper.questions else None
+    question = Question(
+        paper_key=paper.paper_key, board=first.board if first else paper.board,
+        subject=first.subject if first else paper.subject, question_number=number,
+        stem_text="", stem_image_path="", total_marks=marks,
+    )
+    question.parts.append(QuestionPart(
+        id=f"{number}.", question_id=str(number), path="", depth=1,
+        text=step.fields.get("text", ""), image_path="", marks=marks, marks_printed=marks,
+        segments=segments,
+    ))
+    paper.questions.append(question)
+    paper.questions.sort(key=lambda q: q.question_number)
+
+
 def apply_fix(paper: Paper, fix: Fix) -> Paper:
     """A copy of `paper` with every step of `fix` applied (all or nothing)."""
     trial = paper.model_copy(deep=True)
@@ -412,33 +453,12 @@ def apply_fix(paper: Paper, fix: Fix) -> Paper:
 
 
 def apply_all(paper: Paper, fixes: list[Fix]) -> Paper:
-    """`paper` with every applied fix, in order. One that no longer fits (a re-extraction
-    renamed the part it names) is skipped, not fatal - the rest still apply.
-
-    Claude's fixes are re-checked against the paper they now land on: each patched a
-    parser mistake, and once the parser stops making it the fix undoes a right answer.
-    4MA0 3H January 2017: with 12(b)(i)'s scheme row read as 0, Claude set the part to 0;
-    once the row read 1, re-applying that took Q12 to 3 of its 4. So an AI fix applies only
-    while an issue it was made for is still there. It stays in fixes.json as it was -
-    should the parser regress, it applies again. A teacher's own edit always applies.
-
-    Not "and raises none": Claude's fixes chain (a split, then the new part's marks in the
-    next fix), and the split alone raises what the next one clears. And as a backstop, the
-    paper with every fix as before wins if it comes out with fewer issues."""
-    every = _apply(paper, fixes, recheck=False)
-    rechecked = _apply(paper, fixes, recheck=True)
-    if len(validate_paper(every).issues) < len(validate_paper(rechecked).issues):
-        return every
-    return rechecked
-
-
-def _apply(paper: Paper, fixes: list[Fix], recheck: bool) -> Paper:
+    """`paper` with every applied edit, in order. One that no longer fits (a re-extraction
+    renamed the part it names) is skipped, not fatal - the rest still apply. Claude's old
+    fixes are never applied (module docstring)."""
     for fix in fixes:
-        if fix.status != "applied":
+        if fix.status != "applied" or fix.source == "ai":
             continue
-        if recheck and fix.source == "ai" and fix.issues:
-            if not set(open_issues(paper, set())) & set(fix.issues):
-                continue
         try:
             paper = apply_fix(paper, fix)
         except FixError:
@@ -460,31 +480,6 @@ def open_issues(paper: Paper, checked: set[str]) -> dict[str, dict]:
         if key not in checked:
             found[key] = data
     return found
-
-
-def verify(paper: Paper, fix: Fix, checked: set[str]) -> tuple[Paper | None, list[str], list[str]]:
-    """Tries `fix` on a copy: (the fixed paper or None if it doesn't fit, the issue keys it
-    clears, the issue keys it raises). A dismiss clears its own issues by marking them."""
-    before = open_issues(paper, checked)
-    if all(step.op in NOTES for step in fix.steps):
-        if any(step.op == "dismiss" for step in fix.steps):
-            return paper, sorted(k for k in fix.issues if k in before), []
-        return paper, [], []
-    try:
-        after_paper = apply_fix(paper, fix)
-    except FixError:
-        return None, [], []
-    after = open_issues(after_paper, checked)
-    return after_paper, sorted(set(before) - set(after)), sorted(set(after) - set(before))
-
-
-def safe_to_apply(fix: Fix, clears: list[str], raises: list[str]) -> bool:
-    """Auto mode's test: a change to the paper that clears every issue it was meant for (or,
-    when it names none, at least one) and raises none. A dismiss never applies itself - it
-    hides a problem rather than fixing it, so a person decides."""
-    if any(step.op in NOTES for step in fix.steps) or raises or not clears:
-        return False
-    return all(key in clears for key in fix.issues)
 
 
 def rebuild(paper_dir: Path, base: Paper, finish_links) -> Paper:
