@@ -38,7 +38,7 @@ from qbx import llm as llm_mod
 from qbx.classified import (
     ClassifiedSpec, TopicGroup, classify, in_scope, paper_label, parts_label, sitting_label, untagged_parts,
 )
-from qbx import account, api_key, app_version, batch_tagging, difficulty, edition, legal, mac_update, ms_links, saving, terms
+from qbx import account, api_key, app_version, batch_tagging, difficulty, edition, legal, mac_update, ms_links, saving, terms, wipe
 from qbx import fixes as fixes_mod
 from qbx.fixes import Fix, FixError, Step
 from qbx.exam_builder import ExamSource, ExamSpec, build_preferring_new
@@ -375,6 +375,8 @@ def get_state() -> dict:
         # a Mac copy updating itself (qbx/mac_update.py): downloading, ready to restart into,
         # or to be downloaded by hand - None on Windows (the Store updates it) and in debug
         "app_update": mac_update.status(),
+        # whether Settings offers "Delete all my data" (only the packaged app: qbx/wipe.py)
+        "can_delete_data": wipe.available(),
         # requests running for 15s+ (normally none): what a stuck window is waiting on
         "stuck_requests": stuck_requests(),
     }
@@ -501,6 +503,26 @@ def update_open() -> dict:
         raise HTTPException(status_code=404, detail="No update link is set.")
     account.open_url(url)
     return {"url": url}
+
+
+class _DeleteAll(BaseModel):
+    confirm: str
+
+
+@app.post("/api/data/delete_all")
+def delete_all_data(body: _DeleteAll) -> dict:
+    """Settings' "Delete all my data" (qbx/wipe.py): signs out, deletes papers, parsed papers,
+    exams, tags and settings, and closes the app. Saved PDFs stay. The UI sends the word the
+    teacher typed to confirm, so nothing else can trigger it by accident."""
+    if body.confirm.strip().lower() != "delete":
+        raise HTTPException(status_code=400, detail='Type "delete" to confirm.')
+    if _scan_state.get("running") or _tag_state.get("running") or _classified_state.get("running"):
+        raise HTTPException(status_code=409, detail="Wait for the scan, tagging run or booklets to finish, then delete.")
+    try:
+        wipe.delete_all()
+    except wipe.WipeError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True}
 
 
 @app.post("/api/update/install")

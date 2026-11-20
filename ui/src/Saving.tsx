@@ -3,6 +3,7 @@ import { Check, Download, ExternalLink, FileText, FolderOpen, FolderInput, Histo
 import { api, errorMessage } from './api'
 import { Modal } from './Modal'
 import { AboutSection, AppearanceSection } from './Appearance'
+import { DeleteDataSection } from './DeleteData'
 import type { SavedFile, SaveResult, SavingState } from './types'
 
 /* Saving what a teacher makes into their own folder (qbx/saving.py, user-decided): no
@@ -227,6 +228,7 @@ export function SaveFolderSettings({ onClose }: { onClose: () => void }) {
           <SaveFolderField />
         </section>
         <AboutSection />
+        <DeleteDataSection />
       </div>
     </Modal>
   )

@@ -477,6 +477,49 @@ def mac_icon(out: Path) -> Path:
     return out
 
 
+# The DMG's window (user-asked: the familiar "drag to Applications" one): its size in points,
+# and where the two icons sit in it - the background's arrow runs between them.
+DMG_WINDOW = (660, 400)
+DMG_APP_AT = (170, 215)
+DMG_APPLICATIONS_AT = (490, 215)
+
+
+def dmg_background(out: Path) -> Path:
+    """The DMG window's background - title, an arrow from the app to Applications, and
+    the instruction - at 1x and 2x, packed into one .tiff so it's sharp on Retina screens."""
+    import pymupdf
+
+    navy, coral, ink2 = (0x2D / 255, 0x30 / 255, 0x47 / 255), (0xE0 / 255, 0x7A / 255, 0x5F / 255), (0.42, 0.44, 0.5)
+    width, height = DMG_WINDOW
+    (x1, y), (x2, _) = DMG_APP_AT, DMG_APPLICATIONS_AT
+    doc = pymupdf.open()
+    page = doc.new_page(width=width, height=height)
+    page.draw_rect(page.rect, color=None, fill=(0.973, 0.976, 0.984))
+    page.draw_rect(pymupdf.Rect(0, 0, width, 6), color=None, fill=coral)
+
+    def centred(text: str, top: float, size: float, color, font: str) -> None:
+        length = pymupdf.get_text_length(text, fontname=font, fontsize=size)
+        page.insert_text(((width - length) / 2, top), text, fontsize=size, fontname=font, color=color)
+
+    centred("Classark Exam Builder", 58, 24, navy, "hebo")
+    # the arrow: between the icons' edges (128pt icons), a shaft and an open head
+    start, end = x1 + 84, x2 - 84
+    page.draw_line((start, y), (end - 4, y), color=coral, width=5, lineCap=1)
+    page.draw_polyline([(end - 20, y - 16), (end, y), (end - 20, y + 16)], color=coral, width=5, lineCap=1, lineJoin=1)
+    centred("Drag the app onto Applications to install it", height - 46, 14, ink2, "helv")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    pngs = []
+    for scale, suffix in ((1, ""), (2, "@2x")):
+        png = out.with_name(f"{out.stem}{suffix}.png")
+        page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False).save(png)
+        pngs.append(png)
+    doc.close()
+    if sys.platform != "darwin":
+        return pngs[0]
+    _run("tiffutil", "-cathidpicheck", *map(str, pngs), "-out", str(out))
+    return out
+
+
 def _pyinstaller_args(ui_dist: Path, out_dir: Path) -> list[str]:
     separator = ";" if sys.platform == "win32" else ":"
     icon = []
@@ -583,17 +626,33 @@ def build_mac(ui_dist: Path, version: str, out_dir: Path = DIST) -> None:
              "--entitlements", str(entitlements), "--sign", identity, str(app))
         _run("codesign", "--verify", "--deep", "--strict", str(app))
 
-    staging = ROOT / "build" / "dmg"
-    shutil.rmtree(staging, ignore_errors=True)
-    staging.mkdir(parents=True)
-    _run("ditto", str(app), str(staging / app.name))
-    (staging / "Applications").symlink_to("/Applications")
     # which Macs it runs on, since an Intel build and an Apple Silicon one are made apart
     kind = "Apple Silicon" if platform.machine() == "arm64" else "Intel"
     dmg = out_dir / f"{APP_NAME}-{version} ({kind}).dmg"
     dmg.unlink(missing_ok=True)
-    _run("hdiutil", "create", "-volname", APP_NAME, "-srcfolder", str(staging),
-         "-ov", "-format", "UDZO", str(dmg))
+    # dmgbuild writes the window's layout (.DS_Store) itself - no Finder scripting, so it
+    # works on CI's headless Macs too
+    import dmgbuild
+
+    dmgbuild.build_dmg(str(dmg), APP_NAME, settings={
+        "format": "UDZO",
+        "files": [str(app)],
+        "symlinks": {"Applications": "/Applications"},
+        "icon": str(ROOT / "build" / "icon.icns"),
+        "background": str(dmg_background(ROOT / "build" / "dmg-background.tiff")),
+        "window_rect": ((200, 140), DMG_WINDOW),
+        "icon_size": 128,
+        "text_size": 13,
+        "icon_locations": {app.name: DMG_APP_AT, "Applications": DMG_APPLICATIONS_AT},
+        "default_view": "icon-view",
+        "show_status_bar": False,
+        "show_tab_view": False,
+        "show_toolbar": False,
+        "show_pathbar": False,
+        "show_sidebar": False,
+        "show_icon_preview": False,
+        "include_icon_view_settings": True,
+    })
     if not identity:
         print(f"wrote {dmg} - unsigned: set QBX_SIGN_IDENTITY to make one other Macs will open")
         return

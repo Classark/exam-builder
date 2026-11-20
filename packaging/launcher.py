@@ -533,11 +533,13 @@ def _app_window(server, url: str, data: Path) -> None:
             return None
         return chosen if isinstance(chosen, str) else chosen[0]
 
-    from qbx import mac_update, saving
+    from qbx import mac_update, saving, wipe
 
     saving.set_folder_picker(pick_folder)
     # "Restart to update" on a Mac: the swap starts once this window - and so the app - closes
     mac_update.set_quitter(window.destroy)
+    # Settings' "Delete all my data": this folder, then close (qbx/wipe.py)
+    wipe.set_app(data, window.destroy)
     # On Windows the UI's own top bar carries what the File menu did, and a menu strip
     # under the title bar looked bolted on (user feedback); a Mac's menu bar is the norm.
     menu = []

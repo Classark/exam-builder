@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Bot, FileUp, Loader2, Play, Tags } from 'lucide-react'
 import { api, errorMessage } from './api'
 import { AboutSection, AppearanceSection } from './Appearance'
+import { DeleteDataSection } from './DeleteData'
 import { TaggingProgress } from './Tagging'
 import { useLive } from './live'
 import { Modal } from './Modal'
@@ -79,6 +80,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
         </section>
 
         <AboutSection />
+        <DeleteDataSection />
       </div>
 
       {editing && (

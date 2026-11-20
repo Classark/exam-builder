@@ -284,6 +284,8 @@ export interface LiveState {
   update?: UpdateState
   /** a Mac copy updating itself (engine/qbx/mac_update.py); null elsewhere */
   app_update?: AppUpdateState | null
+  /** whether Settings offers "Delete all my data" (the packaged app only) */
+  can_delete_data?: boolean
 }
 
 export interface LibraryProgress {

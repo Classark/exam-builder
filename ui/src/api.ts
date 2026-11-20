@@ -296,6 +296,9 @@ export const api = {
     request<{ version: string; accepted: boolean }>('/api/terms/accept', { method: 'POST', body: JSON.stringify({ version }) }),
   openUpdate: () => request<{ url: string }>('/api/update/open', { method: 'POST' }),
   /** Mac: close, swap in the downloaded update, open again (engine/qbx/mac_update.py) */
+  /** Settings' "Delete all my data": deletes everything, then the app closes (engine/qbx/wipe.py) */
+  deleteAllData: (confirm: string) =>
+    request<{ ok: boolean }>('/api/data/delete_all', { method: 'POST', body: JSON.stringify({ confirm }) }),
   installUpdate: () => request<{ ok: boolean }>('/api/update/install', { method: 'POST' }),
   openAccountPage: (page: 'subscription' | 'credit' | 'terms' | 'privacy' | 'refunds' | 'licence') =>
     request<{ url: string }>(`/api/account/open/${page}`, { method: 'POST' }),
