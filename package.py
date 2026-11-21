@@ -561,6 +561,9 @@ def _pyinstaller_args(ui_dist: Path, out_dir: Path) -> list[str]:
         "--exclude-module", "pymupdf.layout",
         "--exclude-module", "pymupdf4llm",
         "--exclude-module", "onnxruntime",
+        # numpy is there only for those two (nothing in qbx imports it), and its newer
+        # Apple Silicon wheel needs macOS 14, which the app's 11.0 check refuses
+        "--exclude-module", "numpy",
         "--add-data", f"{ui_dist}{separator}ui/dist",
         # data files the engine reads beside its code (the standard periodic table)
         "--add-data", f"{ENGINE / ENGINE_PACKAGE / 'assets'}{separator}{ENGINE_PACKAGE}/assets",
